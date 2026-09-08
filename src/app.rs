@@ -1,17 +1,24 @@
 use crate::db::Database;
 use crate::icons::*;
-use crate::model::{ColumnType, Task};
+use crate::model::{ColumnType, Task, WindowState};
 use crate::theme::*;
 use crate::window_level::set_window_always_on_top;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, rgb, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    actions, div, ease_out_quint, px, rgb, Animation, AnimationExt as _, AnyElement,
+    AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use std::collections::HashSet;
+use gpui_component::tooltip::Tooltip;
+use std::collections::HashMap;
 use std::time::Duration;
+
+actions!(
+    vibe_todo,
+    [NewTask, TogglePin, ToggleHistory, Cancel, DeleteHovered]
+);
 
 /// Travels with a dragged row: where it came from and what to show under the
 /// cursor.
@@ -45,8 +52,28 @@ impl Render for DragGhost {
     }
 }
 
-/// How long a checked row stays visible, struck through, before it leaves.
-const COMPLETION_DWELL: Duration = Duration::from_millis(240);
+/// Where a checked row is in its two-step exit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Completing {
+    /// Struck through and holding still. Clicking the box again puts it back.
+    Held,
+    /// Collapsing out of the list. Past the point of return.
+    Leaving,
+}
+
+/// Long enough to read the strike-through, and the whole of the window in which
+/// a mis-click can be taken back.
+const COMPLETION_HOLD: Duration = Duration::from_millis(240);
+/// The row folding shut afterwards, which commits the write.
+const COMPLETION_COLLAPSE: Duration = Duration::from_millis(160);
+/// The checkbox filling in under the cursor.
+const TICK: Duration = Duration::from_millis(140);
+/// An armed destructive button forgets it was armed after this, so a click
+/// landing minutes later cannot finish something started by accident.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Geometry is read on every frame; this is how long a resize has to settle
+/// before it reaches the database.
+const BOUNDS_SETTLE: Duration = Duration::from_millis(500);
 
 /// The OS owns the top-left corner, so the top strip stays clear for the
 /// traffic lights. It carries no surface and no rule of its own — the glass
@@ -61,6 +88,11 @@ const ROW_RADIUS: f32 = 6.;
 const CARD_RADIUS: f32 = ROW_RADIUS + CARD_PADDING;
 const ROW_HEIGHT: f32 = 36.;
 
+/// The tray's left inset doubles as the length of its fade: wide enough that a
+/// couple of characters dissolve instead of being cut mid-stroke, and no wider,
+/// so the first button still lands on solid colour.
+const TRAY_FADE: f32 = 24.;
+
 /// The card grows with what is in it, then scrolls. Both ends are pinned so the
 /// inbox underneath can never be squeezed out of the window.
 const CARD_HEADER_HEIGHT: f32 = 28.;
@@ -73,20 +105,33 @@ pub struct VibeTodoApp {
     ongoing_tasks: Vec<Task>,
     completed_tasks: Vec<Task>,
     input: Entity<InputState>,
+    /// Renaming gets its own field rather than a mode flag on the one above:
+    /// an unsaved new task and an edit to a saved one end differently, so they
+    /// do not share a buffer.
+    edit_input: Entity<InputState>,
     pub is_pinned: bool,
     pub is_history_open: bool,
     pub is_creating: bool,
-    /// Rows that have been checked and are playing out their dwell.
-    completing: HashSet<String>,
+    /// Whose title is open for editing.
+    editing_id: Option<String>,
+    /// The row under the pointer. Only ⌘⌫ reads it; hover styling is still the
+    /// framework's own.
+    hovered_id: Option<String>,
+    /// A delete armed by a first click, waiting for the second.
+    confirm_delete: Option<String>,
+    /// Rows that have been checked and are playing out their exit.
+    completing: HashMap<String, Completing>,
     /// "Clear all" is armed by a first click and fires on the second.
     confirm_clear: bool,
+    last_bounds: Option<Bounds<Pixels>>,
+    bounds_write_queued: bool,
     pub focus_handle: FocusHandle,
     _input_sub: Subscription,
+    _edit_sub: Subscription,
 }
 
 impl VibeTodoApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let db = Database::new().expect("Failed to initialize SQLite database");
+    pub fn new(db: Database, is_pinned: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let inbox_tasks = db.get_active_tasks(ColumnType::Inbox).unwrap_or_default();
         let ongoing_tasks = db.get_active_tasks(ColumnType::Ongoing).unwrap_or_default();
         let completed_tasks = db.get_completed_tasks().unwrap_or_default();
@@ -96,6 +141,7 @@ impl VibeTodoApp {
                 .placeholder("记一笔，回车保存")
                 .submit_on_enter(true)
         });
+        let edit_input = cx.new(|cx| InputState::new(window, cx).submit_on_enter(true));
 
         let input_sub =
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
@@ -103,6 +149,20 @@ impl VibeTodoApp {
                     this.commit_new_task(window, cx);
                 }
             });
+        let edit_sub = cx.subscribe_in(
+            &edit_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_edit(window, cx);
+                }
+            },
+        );
+
+        // Actions dispatch along the focus path, so the root has to hold focus
+        // from the first frame or none of the shortcuts have anywhere to land.
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
 
         Self {
             db,
@@ -110,13 +170,20 @@ impl VibeTodoApp {
             ongoing_tasks,
             completed_tasks,
             input,
-            is_pinned: false,
+            edit_input,
+            is_pinned,
             is_history_open: false,
             is_creating: false,
-            completing: HashSet::new(),
+            editing_id: None,
+            hovered_id: None,
+            confirm_delete: None,
+            completing: HashMap::new(),
             confirm_clear: false,
-            focus_handle: cx.focus_handle(),
+            last_bounds: None,
+            bounds_write_queued: false,
+            focus_handle,
             _input_sub: input_sub,
+            _edit_sub: edit_sub,
         }
     }
 
@@ -135,12 +202,23 @@ impl VibeTodoApp {
     pub fn toggle_pin(&mut self, cx: &mut Context<Self>) {
         self.is_pinned = !self.is_pinned;
         set_window_always_on_top(self.is_pinned);
+        self.persist_window_state();
         cx.notify();
     }
 
-    pub fn toggle_history(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening a panel finishes whatever was half-written: a new task is
+        // dropped, a rename is kept.
+        self.commit_edit(window, cx);
+        if self.is_creating {
+            self.cancel_new_task(window, cx);
+        }
         self.is_history_open = !self.is_history_open;
         self.confirm_clear = false;
+        self.confirm_delete = None;
+        // The scrim covers the rows, so nothing under the pointer is reachable
+        // any more and ⌘⌫ must not still be aimed at one.
+        self.hovered_id = None;
         if self.is_history_open {
             self.refresh_tasks();
         }
@@ -148,6 +226,11 @@ impl VibeTodoApp {
     }
 
     pub fn start_creating(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Re-entering while the field is already open would wipe what is in it.
+        if self.is_creating {
+            return;
+        }
+        self.commit_edit(window, cx);
         self.is_creating = true;
         self.is_history_open = false;
         self.input
@@ -175,16 +258,91 @@ impl VibeTodoApp {
         cx.notify();
     }
 
-    /// Marks the row done on screen, then writes it away once the dwell ends.
-    pub fn complete_task(&mut self, id: &str, cx: &mut Context<Self>) {
-        if !self.completing.insert(id.to_string()) {
+    /// Opens a title for editing. Unlike the new-task field, this one starts
+    /// from something that already exists, so clicking away keeps the edit.
+    pub fn start_editing(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_id.as_deref() == Some(id) {
             return;
         }
+        self.commit_edit(window, cx);
+        if self.is_creating {
+            self.cancel_new_task(window, cx);
+        }
+        let Some(title) = self.find_task_title(id) else {
+            return;
+        };
+        self.is_history_open = false;
+        self.confirm_delete = None;
+        self.editing_id = Some(id.to_string());
+        self.edit_input
+            .update(cx, |state, cx| state.set_value(title, window, cx));
+        let handle = self.edit_input.focus_handle(cx);
+        handle.focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.editing_id.take() else {
+            return;
+        };
+        let title = self.edit_input.read(cx).value().trim().to_string();
+        // Emptying a title is not a way to delete: the old one stands.
+        if !title.is_empty() {
+            let _ = self.db.update_task_title(&id, &title);
+            self.refresh_tasks();
+        }
+        self.focus_handle.clone().focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_id = None;
+        self.focus_handle.clone().focus(window, cx);
+        cx.notify();
+    }
+
+    fn find_task_title(&self, id: &str) -> Option<String> {
+        self.inbox_tasks
+            .iter()
+            .chain(self.ongoing_tasks.iter())
+            .find(|task| task.id == id)
+            .map(|task| task.title.clone())
+    }
+
+    /// Marks the row done on screen, holds it there long enough to be taken
+    /// back, then folds it away and writes it.
+    pub fn complete_task(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.completing.get(id) {
+            // Still holding: a second click is a change of mind.
+            Some(Completing::Held) => {
+                self.completing.remove(id);
+                cx.notify();
+                return;
+            }
+            Some(Completing::Leaving) => return,
+            None => {}
+        }
+        self.completing.insert(id.to_string(), Completing::Held);
         cx.notify();
 
         let id = id.to_string();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COMPLETION_DWELL).await;
+            cx.background_executor().timer(COMPLETION_HOLD).await;
+            let still_held = this
+                .update(cx, |this, cx| {
+                    if this.completing.get(&id) != Some(&Completing::Held) {
+                        return false;
+                    }
+                    this.completing.insert(id.clone(), Completing::Leaving);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !still_held {
+                return;
+            }
+
+            cx.background_executor().timer(COMPLETION_COLLAPSE).await;
             let _ = this.update(cx, |this, cx| {
                 this.completing.remove(&id);
                 let _ = this.db.complete_task(&id);
@@ -201,8 +359,36 @@ impl VibeTodoApp {
         cx.notify();
     }
 
+    /// The first click arms; the second deletes. Bound to the keyboard the
+    /// arming step is dropped — reaching for ⌘⌫ is already deliberate in a way
+    /// that brushing a 21px button is not.
+    pub fn request_delete(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.confirm_delete.as_deref() == Some(id) {
+            self.confirm_delete = None;
+            self.delete_task(id, cx);
+            return;
+        }
+        self.confirm_delete = Some(id.to_string());
+        cx.notify();
+
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONFIRM_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.confirm_delete.as_deref() == Some(id.as_str()) {
+                    this.confirm_delete = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn delete_task(&mut self, id: &str, cx: &mut Context<Self>) {
         let _ = self.db.delete_task(id);
+        if self.hovered_id.as_deref() == Some(id) {
+            self.hovered_id = None;
+        }
         self.refresh_tasks();
         cx.notify();
     }
@@ -235,6 +421,17 @@ impl VibeTodoApp {
         if !self.confirm_clear {
             self.confirm_clear = true;
             cx.notify();
+
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(CONFIRM_TIMEOUT).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.confirm_clear {
+                        this.confirm_clear = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
             return;
         }
         let _ = self.db.clear_completed_tasks();
@@ -242,9 +439,54 @@ impl VibeTodoApp {
         self.refresh_tasks();
         cx.notify();
     }
+
+    /// The window remembers where it was. gpui has no resize callback, so the
+    /// geometry is read off each frame and written once the movement stops.
+    fn note_window_bounds(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let WindowBounds::Windowed(bounds) = window.window_bounds() else {
+            return;
+        };
+        if self.last_bounds == Some(bounds) {
+            return;
+        }
+        self.last_bounds = Some(bounds);
+        if self.bounds_write_queued {
+            return;
+        }
+        self.bounds_write_queued = true;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BOUNDS_SETTLE).await;
+            let _ = this.update(cx, |this, _| {
+                this.bounds_write_queued = false;
+                this.persist_window_state();
+            });
+        })
+        .detach();
+    }
+
+    fn persist_window_state(&self) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let _ = self.db.save_window_state(&WindowState {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+            is_pinned: self.is_pinned,
+        });
+    }
+
+    fn is_editing(&self) -> bool {
+        self.is_creating || self.editing_id.is_some()
+    }
 }
 
 /// A square hover action: move, delete, priority, restore.
+///
+/// Pressing has to show up the instant the button goes down. gpui has no
+/// transforms, so the only channel for it is one more step of colour.
 fn action_button(
     id: impl Into<SharedString>,
     size: f32,
@@ -263,6 +505,7 @@ fn action_button(
         .cursor_pointer()
         .when(filled, |s| s.bg(rgb(skin.action_bg)))
         .hover(|s| s.bg(rgb(skin.action_bg_hover)))
+        .active(|s| s.bg(rgb(skin.action_bg_active)))
         .child(icon)
 }
 
@@ -357,19 +600,19 @@ fn empty_lines(line: &'static str, hint: &'static str) -> impl IntoElement {
 }
 
 impl VibeTodoApp {
-    fn render_task_row(
-        &self,
-        task: &Task,
-        on_card: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_task_row(&self, task: &Task, on_card: bool, cx: &mut Context<Self>) -> AnyElement {
         let skin = if on_card { CARD } else { LIST };
-        let is_done = self.completing.contains(&task.id);
+        let phase = self.completing.get(&task.id).copied();
+        let is_done = phase.is_some();
+        let is_editing = self.editing_id.as_deref() == Some(task.id.as_str());
+        let is_armed = self.confirm_delete.as_deref() == Some(task.id.as_str());
 
         let id_complete = task.id.clone();
         let id_move = task.id.clone();
         let id_delete = task.id.clone();
         let id_priority = task.id.clone();
+        let id_edit = task.id.clone();
+        let id_hover = task.id.clone();
 
         let ghost_title = SharedString::from(task.title.clone());
         let drag_payload = DraggedTask {
@@ -383,7 +626,7 @@ impl VibeTodoApp {
             ColumnType::Inbox
         };
 
-        div()
+        let row = div()
             .id(SharedString::from(format!("task-row-{}", task.id)))
             .group("task-row")
             .relative()
@@ -398,6 +641,31 @@ impl VibeTodoApp {
             .items_center()
             .rounded(px(ROW_RADIUS))
             .hover(|s| s.bg(rgb(skin.row_hover)))
+            .when(is_editing, |s| {
+                // Clicking away keeps the edit. The new-task field does the
+                // opposite: one is a change to something that exists, the other
+                // was never saved in the first place.
+                s.bg(rgb(skin.row_hover))
+                    .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                        this.commit_edit(window, cx);
+                    }))
+            })
+            // ⌘⌫ acts on whatever the pointer is over, so the row has to say so
+            // in state; an armed delete that scrolls out of reach is a trap, so
+            // leaving the row disarms it.
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered_id = Some(id_hover.clone());
+                } else {
+                    if this.hovered_id.as_deref() == Some(id_hover.as_str()) {
+                        this.hovered_id = None;
+                    }
+                    if this.confirm_delete.as_deref() == Some(id_hover.as_str()) {
+                        this.confirm_delete = None;
+                    }
+                }
+                cx.notify();
+            }))
             // Dropping onto a row inserts above it, which is what the insertion
             // line drawn on drag_over promises.
             .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
@@ -408,17 +676,23 @@ impl VibeTodoApp {
             .child(
                 div()
                     .id(SharedString::from(format!("grip-{}", task.id)))
-                    .w(px(12.))
-                    .h(px(20.))
+                    // Margins pull the box back to the 12px it used to occupy,
+                    // so the target grows without the row's layout moving.
+                    .w(px(20.))
+                    .h(px(28.))
+                    .mx(px(-4.))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_grab()
+                    .active(|s| s.cursor_grabbing())
                     .child(icon_grip(hsl(INK_FAINT)).size(px(12.)))
-                    .on_drag(drag_payload, move |dragged, _offset, _window, cx| {
-                        let title = dragged.title.clone();
-                        cx.new(|_| DragGhost { title })
+                    .when(!is_editing, |s| {
+                        s.on_drag(drag_payload, move |dragged, _offset, _window, cx| {
+                            let title = dragged.title.clone();
+                            cx.new(|_| DragGhost { title })
+                        })
                     }),
             )
             .child(
@@ -430,33 +704,15 @@ impl VibeTodoApp {
                     .flex_1()
                     .min_w(px(0.))
                     .pl(px(4.))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("cb-{}", task.id)))
-                            .w(px(16.))
-                            .h(px(16.))
-                            .flex_none()
-                            .rounded_full()
-                            .border_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .when(is_done, |s| {
-                                s.bg(rgb(DONE))
-                                    .border_color(rgb(DONE))
-                                    .child(icon_check(hsl(0xFFFFFF)).size(px(9.)))
-                            })
-                            .when(!is_done, |s| {
-                                s.bg(rgb(skin.field))
-                                    .border_color(rgb(INK_FAINT))
-                                    .hover(|s| s.border_color(rgb(INK)))
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.complete_task(&id_complete, cx);
-                            })),
-                    )
-                    .when(task.is_priority, |this| {
+                    .child(self.render_checkbox(
+                        task,
+                        skin,
+                        phase,
+                        cx.listener(move |this, _, _, cx| {
+                            this.complete_task(&id_complete, cx);
+                        }),
+                    ))
+                    .when(task.is_priority && !is_editing, |this| {
                         this.child(
                             div()
                                 .flex_none()
@@ -465,93 +721,248 @@ impl VibeTodoApp {
                                 .child(icon_flame(hsl(PRIORITY)).size(px(13.))),
                         )
                     })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_size(px(13.))
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .when(is_done, |s| s.line_through().text_color(rgb(INK_FAINT)))
-                            .when(!is_done, |s| {
-                                s.text_color(rgb(INK)).font_weight(if task.is_priority {
-                                    FontWeight::MEDIUM
-                                } else {
-                                    FontWeight::NORMAL
+                    .when(is_editing, |this| {
+                        this.child(
+                            div().flex_1().min_w(px(0.)).child(
+                                Input::new(&self.edit_input)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .px(px(0.))
+                                    .text_size(px(13.)),
+                            ),
+                        )
+                    })
+                    .when(!is_editing, |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("title-{}", task.id)))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(px(13.))
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                // The only hint that a title can be opened. An
+                                // icon or a rule here would show up on every row
+                                // at rest, which the list cannot afford.
+                                .cursor_text()
+                                .when(is_done, |s| s.line_through().text_color(rgb(INK_FAINT)))
+                                .when(!is_done, |s| {
+                                    s.text_color(rgb(INK)).font_weight(if task.is_priority {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
                                 })
-                            })
-                            .child(task.title.clone()),
-                    ),
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        if event.click_count() >= 2 {
+                                            this.start_editing(&id_edit, window, cx);
+                                        }
+                                    },
+                                ))
+                                .child(task.title.clone()),
+                        )
+                    }),
             )
-            .child(
-                // Opaque on purpose: this slides in over the title and has to
-                // hide it, so it matches the row's own hover colour exactly.
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(6.))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.))
-                    .pl(px(10.))
-                    .bg(rgb(skin.row_hover))
-                    .invisible()
-                    .when(!is_done, |s| s.group_hover("task-row", |s| s.visible()))
-                    .child(
-                        action_button(
-                            format!("prio-{}", task.id),
-                            21.,
-                            skin,
-                            false,
-                            icon_flame(if task.is_priority {
-                                hsl(PRIORITY)
-                            } else {
-                                hsl(INK_SOFT)
+            .when(!is_done && !is_editing, |this| {
+                this.child(
+                    // The tray still sits over the title — it fades in from
+                    // transparent at its left edge so a long title dissolves
+                    // under it instead of being cut mid-character.
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(6.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.))
+                        .pl(px(TRAY_FADE))
+                        .bg(tray_fade(skin))
+                        .invisible()
+                        .group_hover("task-row", |s| s.visible())
+                        .child(
+                            action_button(
+                                format!("prio-{}", task.id),
+                                21.,
+                                skin,
+                                false,
+                                icon_flame(if task.is_priority {
+                                    hsl(PRIORITY)
+                                } else {
+                                    hsl(INK_SOFT)
+                                })
+                                .size(px(11.)),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.toggle_priority(&id_priority, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            // Drag is the pleasant way across; this is the
+                            // reliable one when the list is scrolled away from
+                            // the card.
+                            action_button(
+                                format!("mv-{}", task.id),
+                                21.,
+                                skin,
+                                false,
+                                if on_card {
+                                    icon_arrow_down(hsl(INK_SOFT)).size(px(11.))
+                                } else {
+                                    icon_arrow_up(hsl(INK_SOFT)).size(px(11.))
+                                },
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let target = if on_card {
+                                        ColumnType::Inbox
+                                    } else {
+                                        ColumnType::Ongoing
+                                    };
+                                    this.move_task(&id_move, target, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            action_button(
+                                format!("del-{}", task.id),
+                                21.,
+                                skin,
+                                false,
+                                icon_trash(if is_armed {
+                                    hsl(0xFFFFFF)
+                                } else {
+                                    hsl(INK_SOFT)
+                                })
+                                .size(px(11.)),
+                            )
+                            // Armed. There is no room for words at this size, so
+                            // the colour is the whole of the warning.
+                            .when(is_armed, |s| {
+                                s.bg(rgb(PRIORITY))
+                                    .hover(|s| s.bg(rgb(PRIORITY)))
+                                    .active(|s| s.bg(rgb(PRIORITY)))
                             })
-                            .size(px(11.)),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.request_delete(&id_delete, cx);
+                                },
+                            )),
+                        ),
+                )
+            });
+
+        match phase {
+            Some(Completing::Leaving) => row
+                .overflow_hidden()
+                .with_animation(
+                    SharedString::from(format!("leave-{}", task.id)),
+                    Animation::new(COMPLETION_COLLAPSE).with_easing(ease_out_quint()),
+                    |el, delta| el.h(px(ROW_HEIGHT * (1. - delta))).opacity(1. - delta),
+                )
+                .into_any_element(),
+            _ => row.into_any_element(),
+        }
+    }
+
+    /// The most-clicked control in the window, so its target is the largest
+    /// thing here that does not show. Pressing previews the result rather than
+    /// just darkening: you see what the click is about to do before you let go.
+    fn render_checkbox(
+        &self,
+        task: &Task,
+        skin: Surface,
+        phase: Option<Completing>,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> impl IntoElement {
+        let is_done = phase.is_some();
+        let tick_id = SharedString::from(format!("tick-{}", task.id));
+        // The circle reacts to the whole target around it, so hover and press
+        // are read off the group rather than off the circle's own 16px hitbox.
+        let group = SharedString::from(format!("cb-group-{}", task.id));
+
+        div()
+            .id(SharedString::from(format!("cb-{}", task.id)))
+            .group(group.clone())
+            // 26 x 28 of target inside 16px of layout: the margins give the
+            // extra back so nothing around it moves.
+            .w(px(26.))
+            .h(px(28.))
+            .mx(px(-5.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_click(on_click)
+            .child(
+                div()
+                    .id(SharedString::from(format!("cb-mark-{}", task.id)))
+                    .relative()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .rounded_full()
+                    .border_1()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(is_done, |s| s.border_color(rgb(DONE)).bg(rgb(skin.field)))
+                    .when(!is_done, |s| {
+                        s.bg(rgb(skin.field))
+                            .border_color(rgb(INK_FAINT))
+                            .group_hover(group.clone(), |s| s.border_color(rgb(INK)))
+                            // Pressing previews the outcome instead of merely
+                            // darkening: the colour under the cursor is the one
+                            // the click is about to commit to.
+                            .group_active(group.clone(), |s| {
+                                s.border_color(rgb(DONE)).bg(hsl(DONE).opacity(0.12))
+                            })
+                    })
+                    .when(is_done, |s| {
+                        s.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .with_animation(
+                                    tick_id,
+                                    Animation::new(TICK).with_easing(ease_out_quint()),
+                                    |el, delta| {
+                                        // The fill grows from the middle. With
+                                        // no transforms available, an absolutely
+                                        // positioned disc is the only way to do
+                                        // it without reflowing the row.
+                                        let d = 14. * delta;
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .w(px(d))
+                                                .h(px(d))
+                                                .left(px((14. - d) / 2.))
+                                                .top(px((14. - d) / 2.))
+                                                .rounded_full()
+                                                .bg(rgb(DONE)),
+                                        )
+                                        .child(
+                                            div()
+                                                .opacity(((delta - 0.45) / 0.55).clamp(0., 1.))
+                                                .child(icon_check(hsl(0xFFFFFF)).size(px(9.))),
+                                        )
+                                    },
+                                ),
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_priority(&id_priority, cx);
-                        })),
-                    )
-                    .child(
-                        // Drag is the pleasant way across; this is the reliable
-                        // one when the list is scrolled away from the card.
-                        action_button(
-                            format!("mv-{}", task.id),
-                            21.,
-                            skin,
-                            false,
-                            if on_card {
-                                icon_arrow_down(hsl(INK_SOFT)).size(px(11.))
-                            } else {
-                                icon_arrow_up(hsl(INK_SOFT)).size(px(11.))
-                            },
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let target = if on_card {
-                                ColumnType::Inbox
-                            } else {
-                                ColumnType::Ongoing
-                            };
-                            this.move_task(&id_move, target, cx);
-                        })),
-                    )
-                    .child(
-                        action_button(
-                            format!("del-{}", task.id),
-                            21.,
-                            skin,
-                            false,
-                            icon_trash(hsl(INK_SOFT)).size(px(11.)),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.delete_task(&id_delete, cx);
-                        })),
-                    ),
+                    }),
             )
     }
 
@@ -592,7 +1003,9 @@ impl VibeTodoApp {
                             .child("已完成"),
                     )
                     // Clearing history cannot be undone, so the first click only
-                    // arms the button and says what the second one will do.
+                    // arms the button and says what the second one will do. It
+                    // disarms itself on a timer and when the pointer leaves, so
+                    // a click landing later cannot finish it.
                     .when(!is_empty, |this| {
                         this.child(
                             div()
@@ -605,6 +1018,13 @@ impl VibeTodoApp {
                                 .justify_center()
                                 .cursor_pointer()
                                 .hover(|s| s.bg(rgb(skin.action_bg)))
+                                .active(|s| s.bg(rgb(skin.action_bg_active)))
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    if !*hovered && this.confirm_clear {
+                                        this.confirm_clear = false;
+                                        cx.notify();
+                                    }
+                                }))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.clear_completed(cx);
                                 }))
@@ -648,6 +1068,8 @@ impl VibeTodoApp {
                         .children(self.completed_tasks.iter().map(|task| {
                             let id_restore = task.id.clone();
                             let id_delete = task.id.clone();
+                            let id_hover = task.id.clone();
+                            let is_armed = self.confirm_delete.as_deref() == Some(task.id.as_str());
 
                             div()
                                 .id(SharedString::from(format!("completed-{}", task.id)))
@@ -660,6 +1082,14 @@ impl VibeTodoApp {
                                 .justify_between()
                                 .rounded(px(5.))
                                 .hover(|s| s.bg(rgb(CARD.row_hover)))
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    if !*hovered
+                                        && this.confirm_delete.as_deref() == Some(id_hover.as_str())
+                                    {
+                                        this.confirm_delete = None;
+                                        cx.notify();
+                                    }
+                                }))
                                 .child(
                                     div()
                                         .flex()
@@ -724,11 +1154,21 @@ impl VibeTodoApp {
                                                 19.,
                                                 skin,
                                                 false,
-                                                icon_trash(hsl(INK_SOFT)).size(px(10.)),
+                                                icon_trash(if is_armed {
+                                                    hsl(0xFFFFFF)
+                                                } else {
+                                                    hsl(INK_SOFT)
+                                                })
+                                                .size(px(10.)),
                                             )
+                                            .when(is_armed, |s| {
+                                                s.bg(rgb(PRIORITY))
+                                                    .hover(|s| s.bg(rgb(PRIORITY)))
+                                                    .active(|s| s.bg(rgb(PRIORITY)))
+                                            })
                                             .on_click(
                                                 cx.listener(move |this, _, _, cx| {
-                                                    this.delete_task(&id_delete, cx);
+                                                    this.request_delete(&id_delete, cx);
                                                 }),
                                             ),
                                         ),
@@ -744,7 +1184,6 @@ impl VibeTodoApp {
     /// three actions on the right, and nothing else — no surface, no rule. It
     /// is still the window's drag handle.
     fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_creating = self.is_creating;
         let is_history_open = self.is_history_open;
         let is_pinned = self.is_pinned;
 
@@ -767,19 +1206,21 @@ impl VibeTodoApp {
                     .items_center()
                     .gap(px(2.))
                     .child(
+                        // No state of its own: when this is open the field is
+                        // sitting in the list saying so already.
                         action_button(
                             "btn-add",
                             22.,
                             LIST,
                             false,
-                            icon_plus(if is_creating {
-                                hsl(0xFFFFFF)
-                            } else {
-                                hsl(INK_SOFT)
-                            })
-                            .size(px(13.)),
+                            icon_plus(hsl(INK_SOFT)).size(px(13.)),
                         )
-                        .when(is_creating, |s| s.bg(rgb(INK)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("记一笔")
+                                .action(&NewTask, Some("VibeTodo"))
+                                .build(window, cx)
+                        })
+                        .tooltip_show_delay(TOOLTIP_DELAY)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.start_creating(window, cx);
                         })),
@@ -792,22 +1233,38 @@ impl VibeTodoApp {
                             is_history_open,
                             icon_history(hsl(INK_SOFT)).size(px(12.)),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
+                        .tooltip(|window, cx| {
+                            Tooltip::new("已完成")
+                                .action(&ToggleHistory, Some("VibeTodo"))
+                                .build(window, cx)
+                        })
+                        .tooltip_show_delay(TOOLTIP_DELAY)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_history(window, cx)),
+                        ),
                     )
                     .child(
+                        // Pinning is the one mode that stays on, so it is said
+                        // in the ink the rest of the window already speaks:
+                        // a solid glyph at full strength. A filled swatch behind
+                        // it out-shouted the card it sits above.
                         action_button(
                             "btn-pin",
                             22.,
                             LIST,
                             false,
-                            icon_pin(if is_pinned {
-                                hsl(0xFFFFFF)
+                            if is_pinned {
+                                icon_pin_filled(hsl(INK)).size(px(12.))
                             } else {
-                                hsl(INK_SOFT)
-                            })
-                            .size(px(12.)),
+                                icon_pin(hsl(INK_SOFT)).size(px(12.))
+                            },
                         )
-                        .when(is_pinned, |s| s.bg(rgb(INK)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("窗口置顶")
+                                .action(&TogglePin, Some("VibeTodo"))
+                                .build(window, cx)
+                        })
+                        .tooltip_show_delay(TOOLTIP_DELAY)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_pin(cx))),
                     ),
             )
@@ -932,7 +1389,9 @@ impl VibeTodoApp {
             .items_center()
             .rounded(px(6.))
             .bg(rgb(CARD_SURFACE))
-            // Clicking anywhere else drops the half-written task.
+            // Clicking anywhere else drops the half-written task. A rename does
+            // the opposite and keeps it — one is unsaved, the other is an edit
+            // to something that already exists.
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
                 this.cancel_new_task(window, cx);
             }))
@@ -974,14 +1433,46 @@ impl VibeTodoApp {
     }
 }
 
+/// Long enough that sweeping past a button never summons one. These three are
+/// the only labels in the window, and it is a window people glance at all day.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(600);
+
 impl Render for VibeTodoApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.note_window_bounds(window, cx);
         let is_history_open = self.is_history_open;
 
         div()
             .id("vibe-todo-root")
             .track_focus(&self.focus_handle)
-            .key_context("VibeTodo")
+            // While a field has focus the window drops out of the context that
+            // owns ⌘⌫, so it reaches the text instead of the hovered task.
+            .key_context(if self.is_editing() {
+                "VibeTodo editing"
+            } else {
+                "VibeTodo"
+            })
+            .on_action(cx.listener(|this, _: &NewTask, window, cx| {
+                this.start_creating(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TogglePin, _, cx| this.toggle_pin(cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleHistory, window, cx| this.toggle_history(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                if this.editing_id.is_some() {
+                    this.cancel_edit(window, cx);
+                } else if this.is_creating {
+                    this.cancel_new_task(window, cx);
+                } else if this.is_history_open {
+                    this.toggle_history(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DeleteHovered, _, cx| {
+                if let Some(id) = this.hovered_id.clone() {
+                    this.delete_task(&id, cx);
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -989,24 +1480,6 @@ impl Render for VibeTodoApp {
             .bg(rgb(GROUND))
             .font_family(".SystemUIFont")
             .text_color(rgb(INK))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.to_lowercase();
-                let cmd = event.keystroke.modifiers.platform;
-
-                if cmd && key == "n" {
-                    this.start_creating(window, cx);
-                } else if cmd && event.keystroke.modifiers.shift && key == "p" {
-                    this.toggle_pin(cx);
-                } else if cmd && event.keystroke.modifiers.shift && key == "h" {
-                    this.toggle_history(cx);
-                } else if key == "escape" {
-                    if this.is_history_open {
-                        this.toggle_history(cx);
-                    } else if this.is_creating {
-                        this.cancel_new_task(window, cx);
-                    }
-                }
-            }))
             .child(self.render_chrome(cx))
             .child(self.render_ongoing_card(cx))
             .child(self.render_inbox_list(cx))
@@ -1021,7 +1494,9 @@ impl Render for VibeTodoApp {
                         .left_0()
                         .right_0()
                         .bottom_0()
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_history(window, cx)),
+                        ),
                 )
                 .child(self.render_history_popover(cx))
             })

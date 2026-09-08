@@ -1,8 +1,10 @@
-use crate::model::{ColumnType, Task};
+use crate::model::{ColumnType, Task, WindowState};
 use chrono::Utc;
 use rusqlite::{params, Connection, Result};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+const WINDOW_STATE_KEY: &str = "window";
 
 pub struct Database {
     conn: Connection,
@@ -58,6 +60,11 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 completed_at INTEGER,
                 sort_order INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             ",
         )?;
@@ -179,6 +186,16 @@ impl Database {
         Ok(new_priority == 1)
     }
 
+    /// Renaming never clears a title: an empty edit is rejected by the caller
+    /// and the old one stands, because deleting has its own path.
+    pub fn update_task_title(&self, id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET title = ?1 WHERE id = ?2",
+            params![title, id],
+        )?;
+        Ok(())
+    }
+
     pub fn complete_task(&self, id: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         self.conn.execute(
@@ -205,6 +222,40 @@ impl Database {
     pub fn clear_completed_tasks(&self) -> Result<()> {
         self.conn
             .execute("DELETE FROM tasks WHERE is_completed = 1", [])?;
+        Ok(())
+    }
+
+    fn get_setting(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// A geometry that no longer fits any attached display is dropped rather
+    /// than repaired here — the caller checks it against the screens it can see
+    /// and falls back to centring the window.
+    pub fn load_window_state(&self) -> Option<WindowState> {
+        let raw = self.get_setting(WINDOW_STATE_KEY)?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn save_window_state(&self, state: &WindowState) -> Result<()> {
+        if let Ok(raw) = serde_json::to_string(state) {
+            self.set_setting(WINDOW_STATE_KEY, &raw)?;
+        }
         Ok(())
     }
 
@@ -353,6 +404,54 @@ mod tests {
         db.clear_completed_tasks()?;
         assert_eq!(db.get_completed_tasks()?.len(), 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_rename_keeps_position_and_column() -> Result<()> {
+        let db = Database::new_in_memory()?;
+        let first = db.insert_task("first", false, ColumnType::Ongoing)?;
+        let second = db.insert_task("second", false, ColumnType::Ongoing)?;
+
+        db.update_task_title(&first.id, "first, renamed")?;
+
+        let tasks = db.get_active_tasks(ColumnType::Ongoing)?;
+        // Renaming touches the title and nothing else — order and column stand.
+        assert_eq!(tasks[0].id, second.id);
+        assert_eq!(tasks[1].id, first.id);
+        assert_eq!(tasks[1].title, "first, renamed");
+        assert_eq!(tasks[1].column, ColumnType::Ongoing);
+        Ok(())
+    }
+
+    #[test]
+    fn test_window_state_roundtrip() -> Result<()> {
+        let db = Database::new_in_memory()?;
+        assert!(db.load_window_state().is_none());
+
+        db.save_window_state(&WindowState {
+            x: 120.,
+            y: 64.,
+            width: 380.,
+            height: 520.,
+            is_pinned: true,
+        })?;
+        let restored = db.load_window_state().expect("just saved");
+        assert_eq!(restored.x, 120.);
+        assert_eq!(restored.height, 520.);
+        assert!(restored.is_pinned);
+
+        // Saving again overwrites rather than accumulating rows.
+        db.save_window_state(&WindowState {
+            x: 0.,
+            y: 0.,
+            width: 300.,
+            height: 400.,
+            is_pinned: false,
+        })?;
+        let restored = db.load_window_state().expect("just saved");
+        assert_eq!(restored.width, 300.);
+        assert!(!restored.is_pinned);
         Ok(())
     }
 }

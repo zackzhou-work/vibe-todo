@@ -35,3 +35,16 @@ pub struct Task {
     pub created_at: i64,
     pub completed_at: Option<i64>,
 }
+
+/// What the window looked like when it was last touched, so it comes back the
+/// way it was left instead of jumping to the centre of the screen. Pinning
+/// lives here too: a widget that forgets it was kept on top has to be told
+/// again every launch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WindowState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub is_pinned: bool,
+}

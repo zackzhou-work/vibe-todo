@@ -8,7 +8,7 @@
 //! Colour is rationed to two, one job each: blue means done, red means
 //! priority. Nothing else is allowed a hue.
 
-use gpui::{px, rgb, rgba, BoxShadow, Hsla};
+use gpui::{linear_color_stop, linear_gradient, px, rgb, rgba, Background, BoxShadow, Hsla};
 
 /// The whole window. Warm — R and G above B — because the cool grey it
 /// replaced read as clinical at this size.
@@ -36,6 +36,10 @@ pub struct Surface {
     pub row_hover: u32,
     pub action_bg: u32,
     pub action_bg_hover: u32,
+    /// One step past hover. Pressing has to change something the instant the
+    /// button goes down — gpui has no transforms, so colour is the only channel
+    /// available for it.
+    pub action_bg_active: u32,
     pub field: u32,
 }
 
@@ -43,6 +47,7 @@ pub const CARD: Surface = Surface {
     row_hover: 0xF6F4F0,
     action_bg: 0xEDEAE4,
     action_bg_hover: 0xE2DED6,
+    action_bg_active: 0xD6D1C7,
     field: 0xFFFFFF,
 };
 
@@ -50,8 +55,30 @@ pub const LIST: Surface = Surface {
     row_hover: 0xF3F0EA,
     action_bg: 0xE9E5DD,
     action_bg_hover: 0xDED9CF,
+    action_bg_active: 0xD1CBBF,
     field: 0xFFFFFF,
 };
+
+/// The hover tray's own background: transparent at its left edge, solid by the
+/// time the first button starts, so a long title dissolves under it instead of
+/// being cut off mid-character.
+///
+/// Both stops are `row_hover` and differ only in alpha. Fading to a generic
+/// transparent instead interpolates through it and leaves a grey smear down the
+/// middle of the ramp.
+pub fn tray_fade(skin: Surface) -> Background {
+    linear_gradient(
+        // 0 is up, increasing clockwise: 90 runs left to right.
+        90.,
+        linear_color_stop(hsl(skin.row_hover).opacity(0.), 0.),
+        linear_color_stop(hsl(skin.row_hover), TRAY_FADE_END),
+    )
+}
+
+/// Where the ramp reaches full opacity, as a fraction of the tray's width. Set
+/// so it lands on the first button's left edge — a button half-sunk in the ramp
+/// shows the title faintly through itself.
+const TRAY_FADE_END: f32 = 0.25;
 
 /// The card is barely a different colour from the ground now, so this is what
 /// separates it: a contact shadow to sit it down, and a wider one to lift it.
