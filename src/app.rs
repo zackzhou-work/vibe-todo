@@ -31,14 +31,12 @@ impl Render for DragGhost {
         div()
             .max_w(px(240.))
             .px(px(10.))
-            .py(px(6.))
-            .rounded(px(6.))
-            .bg(rgb(0xFFFFFF))
-            .border_1()
-            .border_color(rgb(RULE))
-            .shadow_lg()
+            .py(px(7.))
+            .rounded(px(8.))
+            .bg(rgb(CARD_SURFACE))
+            .shadow(card_shadow())
             .font_family(".SystemUIFont")
-            .text_size(px(12.5))
+            .text_size(px(13.))
             .text_color(rgb(INK))
             .whitespace_nowrap()
             .overflow_hidden()
@@ -50,11 +48,24 @@ impl Render for DragGhost {
 /// How long a checked row stays visible, struck through, before it leaves.
 const COMPLETION_DWELL: Duration = Duration::from_millis(240);
 
-/// The OS owns the top-left corner, so the window is tiered: a chrome strip
-/// carrying the traffic lights and the app's actions, then the two columns,
-/// each labelling itself in line with its own content.
+/// The OS owns the top-left corner, so the top strip stays clear for the
+/// traffic lights. It carries no surface and no rule of its own — the glass
+/// runs straight through it into the window.
 const CHROME_HEIGHT: f32 = 34.;
-const HEADING_HEIGHT: f32 = 24.;
+const GUTTER: f32 = 12.;
+const CARD_PADDING: f32 = 8.;
+const ROW_RADIUS: f32 = 6.;
+/// Apple's concentric rule: an outer radius equals the inner one plus the
+/// padding between them, so the two curves stay parallel. (gpui draws plain
+/// circular arcs — the continuous curvature half of the spec is not available.)
+const CARD_RADIUS: f32 = ROW_RADIUS + CARD_PADDING;
+const ROW_HEIGHT: f32 = 36.;
+
+/// The card grows with what is in it, then scrolls. Both ends are pinned so the
+/// inbox underneath can never be squeezed out of the window.
+const CARD_HEADER_HEIGHT: f32 = 28.;
+const CARD_MIN_HEIGHT: f32 = 92.;
+const CARD_MAX_HEIGHT: f32 = 192.;
 
 pub struct VibeTodoApp {
     db: Database,
@@ -237,7 +248,7 @@ impl VibeTodoApp {
 fn action_button(
     id: impl Into<SharedString>,
     size: f32,
-    skin: ColumnSkin,
+    skin: Surface,
     filled: bool,
     icon: gpui::Svg,
 ) -> gpui::Stateful<gpui::Div> {
@@ -245,7 +256,7 @@ fn action_button(
         .id(id.into())
         .w(px(size))
         .h(px(size))
-        .rounded(px(4.))
+        .rounded(px(5.))
         .flex()
         .items_center()
         .justify_center()
@@ -253,33 +264,6 @@ fn action_button(
         .when(filled, |s| s.bg(rgb(skin.action_bg)))
         .hover(|s| s.bg(rgb(skin.action_bg_hover)))
         .child(icon)
-}
-
-/// Column heading: name, then the count of what is in it.
-fn column_heading(label: &'static str, count: usize, skin: ColumnSkin) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.))
-        .child(
-            div()
-                .text_size(px(10.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(INK_SOFT))
-                .child(label),
-        )
-        .child(
-            div()
-                .text_size(px(10.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(skin.count_fg))
-                .bg(rgb(skin.count_bg))
-                .px(px(5.))
-                .py(px(1.))
-                .rounded(px(8.))
-                .child(format!("{}", count)),
-        )
 }
 
 /// Marks exactly where a dragged row will land: a ring on the left end of a
@@ -316,25 +300,57 @@ fn drop_indicator(group: &'static str) -> impl IntoElement {
         .child(div().flex_1().h(px(1.5)).bg(rgb(INK)))
 }
 
-/// Shown when a column has nothing in it. An empty column should say what to
-/// do next, not just sit blank.
-fn empty_state(line: &'static str, hint: &'static str) -> impl IntoElement {
+/// The card names itself; the count sits opposite. The inbox below stays
+/// unlabelled — it is everything else, which needs no introduction.
+fn card_heading(count: usize) -> impl IntoElement {
     div()
-        .flex_1()
+        .h(px(CARD_HEADER_HEIGHT))
+        .flex_none()
+        .px(px(CARD_PADDING + 4.))
+        .pt(px(8.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(INK_SOFT))
+                .child("进行中"),
+        )
+        .child(
+            div()
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(INK_SOFT))
+                .bg(rgb(CARD.action_bg))
+                .px(px(5.))
+                .py(px(1.))
+                .rounded(px(8.))
+                .child(format!("{}", count)),
+        )
+}
+
+/// An empty region says what to do next rather than sitting blank. There is no
+/// heading anywhere in the window, so for the card this copy is also the only
+/// thing that says what the card is for.
+fn empty_lines(line: &'static str, hint: &'static str) -> impl IntoElement {
+    div()
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(4.))
+        .gap(px(3.))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(12.5))
                 .text_color(rgb(INK_SOFT))
                 .child(line),
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(11.5))
                 .text_color(rgb(INK_FAINT))
                 .child(hint),
         )
@@ -344,10 +360,10 @@ impl VibeTodoApp {
     fn render_task_row(
         &self,
         task: &Task,
-        is_inbox: bool,
+        on_card: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let skin = if is_inbox { INBOX_SKIN } else { ONGOING_SKIN };
+        let skin = if on_card { CARD } else { LIST };
         let is_done = self.completing.contains(&task.id);
 
         let id_complete = task.id.clone();
@@ -361,23 +377,26 @@ impl VibeTodoApp {
             title: ghost_title.clone(),
         };
         let anchor_id = task.id.clone();
-        let drop_column = if is_inbox {
-            ColumnType::Inbox
-        } else {
+        let drop_column = if on_card {
             ColumnType::Ongoing
+        } else {
+            ColumnType::Inbox
         };
 
         div()
             .id(SharedString::from(format!("task-row-{}", task.id)))
             .group("task-row")
             .relative()
-            .h(px(32.))
+            .h(px(ROW_HEIGHT))
+            // gpui defaults flex_shrink to 1, so without this a short window
+            // compresses every row instead of scrolling.
+            .flex_none()
             .pl(px(4.))
             .pr(px(6.))
             .flex()
             .flex_row()
             .items_center()
-            .rounded(px(6.))
+            .rounded(px(ROW_RADIUS))
             .hover(|s| s.bg(rgb(skin.row_hover)))
             // Dropping onto a row inserts above it, which is what the insertion
             // line drawn on drag_over promises.
@@ -414,22 +433,22 @@ impl VibeTodoApp {
                     .child(
                         div()
                             .id(SharedString::from(format!("cb-{}", task.id)))
-                            .w(px(14.))
-                            .h(px(14.))
+                            .w(px(16.))
+                            .h(px(16.))
                             .flex_none()
-                            .rounded(px(3.))
+                            .rounded_full()
                             .border_1()
                             .flex()
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
                             .when(is_done, |s| {
-                                s.bg(rgb(INK))
-                                    .border_color(rgb(INK))
+                                s.bg(rgb(DONE))
+                                    .border_color(rgb(DONE))
                                     .child(icon_check(hsl(0xFFFFFF)).size(px(9.)))
                             })
                             .when(!is_done, |s| {
-                                s.bg(rgb(0xFFFFFF))
+                                s.bg(rgb(skin.field))
                                     .border_color(rgb(INK_FAINT))
                                     .hover(|s| s.border_color(rgb(INK)))
                             })
@@ -450,7 +469,7 @@ impl VibeTodoApp {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .text_size(px(12.5))
+                            .text_size(px(13.))
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_ellipsis()
@@ -466,6 +485,8 @@ impl VibeTodoApp {
                     ),
             )
             .child(
+                // Opaque on purpose: this slides in over the title and has to
+                // hide it, so it matches the row's own hover colour exactly.
                 div()
                     .absolute()
                     .top_0()
@@ -482,7 +503,7 @@ impl VibeTodoApp {
                     .child(
                         action_button(
                             format!("prio-{}", task.id),
-                            20.,
+                            21.,
                             skin,
                             false,
                             icon_flame(if task.is_priority {
@@ -497,22 +518,24 @@ impl VibeTodoApp {
                         })),
                     )
                     .child(
+                        // Drag is the pleasant way across; this is the reliable
+                        // one when the list is scrolled away from the card.
                         action_button(
                             format!("mv-{}", task.id),
-                            20.,
+                            21.,
                             skin,
                             false,
-                            if is_inbox {
-                                icon_arrow_right(hsl(INK_SOFT)).size(px(11.))
+                            if on_card {
+                                icon_arrow_down(hsl(INK_SOFT)).size(px(11.))
                             } else {
-                                icon_arrow_left(hsl(INK_SOFT)).size(px(11.))
+                                icon_arrow_up(hsl(INK_SOFT)).size(px(11.))
                             },
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let target = if is_inbox {
-                                ColumnType::Ongoing
-                            } else {
+                            let target = if on_card {
                                 ColumnType::Inbox
+                            } else {
+                                ColumnType::Ongoing
                             };
                             this.move_task(&id_move, target, cx);
                         })),
@@ -520,7 +543,7 @@ impl VibeTodoApp {
                     .child(
                         action_button(
                             format!("del-{}", task.id),
-                            20.,
+                            21.,
                             skin,
                             false,
                             icon_trash(hsl(INK_SOFT)).size(px(11.)),
@@ -533,7 +556,7 @@ impl VibeTodoApp {
     }
 
     fn render_history_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let skin = ONGOING_SKIN;
+        let skin = CARD;
         let confirm_clear = self.confirm_clear;
         let is_empty = self.completed_tasks.is_empty();
 
@@ -541,21 +564,21 @@ impl VibeTodoApp {
             .id("history-popover")
             .absolute()
             .top(px(CHROME_HEIGHT + 2.))
-            .right(px(10.))
+            .right(px(GUTTER))
             .w(px(272.))
-            .max_h(px(282.))
-            .bg(rgb(POPOVER_SURFACE))
+            .max_h(px(300.))
+            .bg(rgb(CARD_SURFACE))
             .border_1()
-            .border_color(rgb(RULE))
-            .rounded(px(8.))
-            .shadow_lg()
+            .border_color(rgb(HAIRLINE))
+            .rounded(px(10.))
+            .shadow(popover_shadow())
             .flex()
             .flex_col()
             .overflow_hidden()
             .child(
                 div()
                     .px(px(10.))
-                    .pt(px(8.))
+                    .pt(px(9.))
                     .pb(px(4.))
                     .flex()
                     .flex_row()
@@ -563,10 +586,10 @@ impl VibeTodoApp {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(INK_SOFT))
-                            .child("COMPLETED"),
+                            .child("已完成"),
                     )
                     // Clearing history cannot be undone, so the first click only
                     // arms the button and says what the second one will do.
@@ -574,9 +597,9 @@ impl VibeTodoApp {
                         this.child(
                             div()
                                 .id("clear-completed")
-                                .h(px(18.))
+                                .h(px(19.))
                                 .px(px(5.))
-                                .rounded(px(3.))
+                                .rounded(px(4.))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -588,7 +611,7 @@ impl VibeTodoApp {
                                 .when(confirm_clear, |s| {
                                     s.child(
                                         div()
-                                            .text_size(px(10.5))
+                                            .text_size(px(11.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(PRIORITY))
                                             .child("再点一次清空"),
@@ -635,8 +658,8 @@ impl VibeTodoApp {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .rounded(px(4.))
-                                .hover(|s| s.bg(rgb(0xF4F3F0)))
+                                .rounded(px(5.))
+                                .hover(|s| s.bg(rgb(CARD.row_hover)))
                                 .child(
                                     div()
                                         .flex()
@@ -647,23 +670,23 @@ impl VibeTodoApp {
                                         .min_w(px(0.))
                                         .child(
                                             div()
-                                                .w(px(14.))
-                                                .h(px(14.))
+                                                .w(px(16.))
+                                                .h(px(16.))
                                                 .flex_none()
-                                                .rounded(px(3.))
-                                                .bg(rgb(0xF0EFEC))
+                                                .rounded_full()
+                                                .bg(rgb(DONE))
                                                 .border_1()
-                                                .border_color(rgb(INK_FAINT))
+                                                .border_color(rgb(DONE))
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
-                                                .child(icon_check(hsl(INK_SOFT)).size(px(9.))),
+                                                .child(icon_check(hsl(0xFFFFFF)).size(px(9.))),
                                         )
                                         .child(
                                             div()
                                                 .flex_1()
                                                 .min_w(px(0.))
-                                                .text_size(px(12.))
+                                                .text_size(px(12.5))
                                                 .text_color(rgb(INK_SOFT))
                                                 .line_through()
                                                 .whitespace_nowrap()
@@ -684,7 +707,7 @@ impl VibeTodoApp {
                                         .child(
                                             action_button(
                                                 format!("restore-{}", task.id),
-                                                18.,
+                                                19.,
                                                 skin,
                                                 false,
                                                 icon_rotate_ccw(hsl(INK_SOFT)).size(px(10.)),
@@ -698,7 +721,7 @@ impl VibeTodoApp {
                                         .child(
                                             action_button(
                                                 format!("cdel-{}", task.id),
-                                                18.,
+                                                19.,
                                                 skin,
                                                 false,
                                                 icon_trash(hsl(INK_SOFT)).size(px(10.)),
@@ -717,8 +740,9 @@ impl VibeTodoApp {
 }
 
 impl VibeTodoApp {
-    /// The chrome strip: window controls on the left (drawn by macOS), the
-    /// app's three actions on the right, one surface across the full width.
+    /// The top strip: traffic lights on the left (drawn by macOS), the app's
+    /// three actions on the right, and nothing else — no surface, no rule. It
+    /// is still the window's drag handle.
     fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_creating = self.is_creating;
         let is_history_open = self.is_history_open;
@@ -727,14 +751,11 @@ impl VibeTodoApp {
         div()
             .h(px(CHROME_HEIGHT))
             .flex_none()
-            .px(px(10.))
+            .px(px(GUTTER))
             .flex()
             .flex_row()
             .items_center()
             .justify_end()
-            .bg(rgb(CHROME_SURFACE))
-            .border_b_1()
-            .border_color(rgb(RULE))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, window, _| window.start_window_move()),
@@ -749,7 +770,7 @@ impl VibeTodoApp {
                         action_button(
                             "btn-add",
                             22.,
-                            ONGOING_SKIN,
+                            LIST,
                             false,
                             icon_plus(if is_creating {
                                 hsl(0xFFFFFF)
@@ -767,7 +788,7 @@ impl VibeTodoApp {
                         action_button(
                             "btn-history",
                             22.,
-                            ONGOING_SKIN,
+                            LIST,
                             is_history_open,
                             icon_history(hsl(INK_SOFT)).size(px(12.)),
                         )
@@ -777,7 +798,7 @@ impl VibeTodoApp {
                         action_button(
                             "btn-pin",
                             22.,
-                            ONGOING_SKIN,
+                            LIST,
                             false,
                             icon_pin(if is_pinned {
                                 hsl(0xFFFFFF)
@@ -792,85 +813,125 @@ impl VibeTodoApp {
             )
     }
 
-    fn render_column(
-        &self,
-        label: &'static str,
-        tasks: &[Task],
-        column: ColumnType,
-        empty_line: &'static str,
-        empty_hint: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_inbox = column == ColumnType::Inbox;
-        let skin = if is_inbox { INBOX_SKIN } else { ONGOING_SKIN };
-        let show_add_row = is_inbox && self.is_creating;
-        let is_empty = tasks.is_empty() && !show_add_row;
+    /// What is actually being worked on. The only opaque surface in the window,
+    /// which is the whole of how it says "this is the live one" — the rows
+    /// inside are the same rows as the inbox below.
+    fn render_ongoing_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_empty = self.ongoing_tasks.is_empty();
 
         div()
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
+            .id("ongoing-card")
+            .flex_none()
+            .mx(px(GUTTER))
+            .min_h(px(CARD_MIN_HEIGHT))
+            .max_h(px(CARD_MAX_HEIGHT))
             .flex()
             .flex_col()
-            .bg(rgb(skin.surface))
+            .rounded(px(CARD_RADIUS))
+            .bg(rgb(CARD_SURFACE))
+            .shadow(card_shadow())
+            // The border is what makes the white card meet the grey ground
+            // cleanly; on drag it darkens rather than appearing, so arming the
+            // drop target cannot shift the card by a pixel.
+            .border_1()
+            .border_color(rgb(HAIRLINE))
+            .drag_over::<DraggedTask>(|s, _, _, _| s.border_color(rgb(INK_FAINT)))
             .overflow_hidden()
-            .child(
-                div()
-                    .h(px(HEADING_HEIGHT))
-                    .flex_none()
-                    .px(px(12.))
-                    .pt(px(6.))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(column_heading(label, tasks.len(), skin)),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("{}-list", label)))
-                    .when(!is_empty, |s| s.flex_1())
-                    .px(px(8.))
-                    .py(px(4.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .overflow_y_scroll()
-                    // Dropping past the last row appends to this column.
-                    .when(show_add_row, |this| this.child(self.render_add_row(cx)))
-                    .children(
-                        tasks
-                            .iter()
-                            .map(|task| self.render_task_row(task, is_inbox, cx)),
-                    )
-                    .child(
-                        div()
-                            .id("drop-end")
-                            .group("drop-end")
-                            .relative()
-                            .flex_1()
-                            .min_h(px(10.))
-                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                                this.reposition_task(&dragged.id, column, None, cx);
-                            }))
-                            .child(drop_indicator("drop-end")),
-                    ),
-            )
+            // Dropping anywhere on the card appends; a row under the cursor
+            // takes precedence and inserts above itself instead.
+            .on_drop(cx.listener(|this, dragged: &DraggedTask, _, cx| {
+                this.reposition_task(&dragged.id, ColumnType::Ongoing, None, cx);
+            }))
+            .child(card_heading(self.ongoing_tasks.len()))
             .when(is_empty, |this| {
-                this.child(empty_state(empty_line, empty_hint))
+                this.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(empty_lines("还没有开始的事", "从下面拖一件上来")),
+                )
             })
+            .when(!is_empty, |this| {
+                this.child(
+                    div()
+                        .id("ongoing-list")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .p(px(CARD_PADDING))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .overflow_y_scroll()
+                        .children(
+                            self.ongoing_tasks
+                                .iter()
+                                .map(|task| self.render_task_row(task, true, cx)),
+                        ),
+                )
+            })
+    }
+
+    /// Everything parked. Sits directly on the glass with no container of its
+    /// own — the card above is the only thing in the window that gets one.
+    fn render_inbox_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_add_row = self.is_creating;
+        let is_empty = self.inbox_tasks.is_empty() && !show_add_row;
+
+        div()
+            .id("inbox-list")
+            .flex_1()
+            .min_h(px(0.))
+            // GUTTER + the card's own inner padding, so a row in the list and a
+            // row in the card start at exactly the same x.
+            .px(px(GUTTER + CARD_PADDING))
+            .pt(px(10.))
+            .pb(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .overflow_y_scroll()
+            .when(show_add_row, |this| this.child(self.render_add_row(cx)))
+            .children(
+                self.inbox_tasks
+                    .iter()
+                    .map(|task| self.render_task_row(task, false, cx)),
+            )
+            // The tail takes drops that land past the last row, and is where
+            // the empty copy goes so that an empty inbox is still a target.
+            .child(
+                div()
+                    .id("drop-end")
+                    .group("drop-end")
+                    .relative()
+                    .flex_1()
+                    .min_h(px(12.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_drop(cx.listener(|this, dragged: &DraggedTask, _, cx| {
+                        this.reposition_task(&dragged.id, ColumnType::Inbox, None, cx);
+                    }))
+                    .child(drop_indicator("drop-end"))
+                    .when(is_empty, |this| {
+                        this.child(empty_lines("收件箱是空的", "⌘N 记一笔"))
+                    }),
+            )
     }
 
     fn render_add_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("add-row")
-            .h(px(32.))
+            .h(px(ROW_HEIGHT))
+            .flex_none()
             .pl(px(4.))
             .pr(px(6.))
             .flex()
             .flex_row()
             .items_center()
             .rounded(px(6.))
-            .bg(rgb(0xFFFFFF))
+            .bg(rgb(CARD_SURFACE))
             // Clicking anywhere else drops the half-written task.
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
                 this.cancel_new_task(window, cx);
@@ -889,13 +950,13 @@ impl VibeTodoApp {
                     .pl(px(4.))
                     .child(
                         div()
-                            .w(px(14.))
-                            .h(px(14.))
+                            .w(px(16.))
+                            .h(px(16.))
                             .flex_none()
-                            .rounded(px(3.))
+                            .rounded_full()
                             .border_1()
-                            .border_color(rgb(RULE))
-                            .bg(rgb(0xFFFFFF)),
+                            .border_color(rgb(INK_FAINT))
+                            .bg(rgb(CARD_SURFACE)),
                     )
                     .child(
                         div().flex_1().min_w(px(0.)).child(
@@ -906,7 +967,7 @@ impl VibeTodoApp {
                                 .appearance(false)
                                 .focus_bordered(false)
                                 .px(px(0.))
-                                .text_size(px(12.5)),
+                                .text_size(px(13.)),
                         ),
                     ),
             )
@@ -925,9 +986,7 @@ impl Render for VibeTodoApp {
             .size_full()
             .flex()
             .flex_col()
-            // The window frame is the OS's job; drawing a second rounded border
-            // inside it only produces square corners around a rounded card.
-            .bg(rgb(ONGOING_SURFACE))
+            .bg(rgb(GROUND))
             .font_family(".SystemUIFont")
             .text_color(rgb(INK))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -949,32 +1008,8 @@ impl Render for VibeTodoApp {
                 }
             }))
             .child(self.render_chrome(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    // LEFT: cool, recessed. Where thoughts get parked.
-                    .child(self.render_column(
-                        "INBOX",
-                        &self.inbox_tasks,
-                        ColumnType::Inbox,
-                        "收件箱是空的",
-                        "⌘N 记一笔",
-                        cx,
-                    ))
-                    // RIGHT: warm, raised. What is actually alive.
-                    .child(self.render_column(
-                        "ONGOING",
-                        &self.ongoing_tasks,
-                        ColumnType::Ongoing,
-                        "没有进行中的事",
-                        "把左边的任务推过来",
-                        cx,
-                    )),
-            )
+            .child(self.render_ongoing_card(cx))
+            .child(self.render_inbox_list(cx))
             // The scrim starts below the chrome so a second click on the history
             // button reaches the button instead of being cancelled out by it.
             .when(is_history_open, |this| {

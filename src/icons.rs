@@ -8,9 +8,9 @@ pub const PLUS_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2
 
 pub const TRASH_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"#;
 
-pub const ARROW_RIGHT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>"#;
+pub const ARROW_UP_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>"#;
 
-pub const ARROW_LEFT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>"#;
+pub const ARROW_DOWN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>"#;
 
 pub const ROTATE_CCW_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>"#;
 
@@ -36,12 +36,12 @@ pub fn icon_trash(color: Hsla) -> Svg {
     svg().data(TRASH_SVG).text_color(color)
 }
 
-pub fn icon_arrow_right(color: Hsla) -> Svg {
-    svg().data(ARROW_RIGHT_SVG).text_color(color)
+pub fn icon_arrow_up(color: Hsla) -> Svg {
+    svg().data(ARROW_UP_SVG).text_color(color)
 }
 
-pub fn icon_arrow_left(color: Hsla) -> Svg {
-    svg().data(ARROW_LEFT_SVG).text_color(color)
+pub fn icon_arrow_down(color: Hsla) -> Svg {
+    svg().data(ARROW_DOWN_SVG).text_color(color)
 }
 
 pub fn icon_rotate_ccw(color: Hsla) -> Svg {

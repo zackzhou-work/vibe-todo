@@ -6,7 +6,7 @@ fn main() {
         gpui_component::init(cx);
 
         let window_bounds =
-            WindowBounds::Windowed(Bounds::centered(None, size(px(600.), px(360.)), cx));
+            WindowBounds::Windowed(Bounds::centered(None, size(px(380.), px(520.)), cx));
 
         let options = WindowOptions {
             window_bounds: Some(window_bounds),
@@ -20,7 +20,7 @@ fn main() {
             kind: WindowKind::Normal,
             is_movable: true,
             is_resizable: true,
-            window_min_size: Some(size(px(420.), px(220.))),
+            window_min_size: Some(size(px(320.), px(280.))),
             ..Default::default()
         };
 
