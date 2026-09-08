@@ -1,0 +1,7 @@
+/target
+
+# Local task database, created next to the binary when the user data dir is
+# unavailable.
+todo.db
+todo.db-shm
+todo.db-wal
