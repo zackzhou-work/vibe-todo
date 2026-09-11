@@ -67,8 +67,6 @@ enum Completing {
 const COMPLETION_HOLD: Duration = Duration::from_millis(240);
 /// The row folding shut afterwards, which commits the write.
 const COMPLETION_COLLAPSE: Duration = Duration::from_millis(160);
-/// The checkbox filling in under the cursor.
-const TICK: Duration = Duration::from_millis(140);
 /// An armed destructive button forgets it was armed after this, so a click
 /// landing minutes later cannot finish something started by accident.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
@@ -410,12 +408,6 @@ impl VibeTodoApp {
         cx.notify();
     }
 
-    pub fn move_task(&mut self, id: &str, target: ColumnType, cx: &mut Context<Self>) {
-        let _ = self.db.move_task_column(id, target);
-        self.refresh_tasks();
-        cx.notify();
-    }
-
     pub fn toggle_priority(&mut self, id: &str, cx: &mut Context<Self>) {
         let _ = self.db.toggle_task_priority(id);
         self.refresh_tasks();
@@ -638,7 +630,6 @@ impl VibeTodoApp {
         let is_armed = self.confirm_delete.as_deref() == Some(task.id.as_str());
 
         let id_complete = task.id.clone();
-        let id_move = task.id.clone();
         let id_delete = task.id.clone();
         let id_priority = task.id.clone();
         let id_edit = task.id.clone();
@@ -649,11 +640,8 @@ impl VibeTodoApp {
             id: task.id.clone(),
             title: ghost_title.clone(),
         };
+        let title_drag_payload = drag_payload.clone();
         let anchor_id = task.id.clone();
-        let other_column = match column {
-            ColumnType::Ongoing => ColumnType::Inbox,
-            ColumnType::Inbox => ColumnType::Ongoing,
-        };
 
         let row = div()
             .id(SharedString::from(format!("task-row-{}", task.id)))
@@ -706,9 +694,9 @@ impl VibeTodoApp {
                     .id(SharedString::from(format!("grip-{}", task.id)))
                     // Margins pull the box back to the 12px it used to occupy,
                     // so the target grows without the row's layout moving.
-                    .w(px(20.))
+                    .w(px(24.))
                     .h(px(28.))
-                    .mx(px(-4.))
+                    .mx(px(-6.))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -721,7 +709,7 @@ impl VibeTodoApp {
                     // and must not be grabbable through it — the grip does not.
                     .opacity(0.)
                     .group_hover("task-row", |s| s.opacity(1.))
-                    .child(icon_grip(hsl(INK_FAINT)).size(px(12.)))
+                    .child(icon_grip(hsl(INK_FAINT)).size(px(16.)))
                     .when(!is_editing, |s| {
                         s.on_drag(drag_payload, move |dragged, _offset, _window, cx| {
                             let title = dragged.title.clone();
@@ -738,23 +726,6 @@ impl VibeTodoApp {
                     .flex_1()
                     .min_w(px(0.))
                     .pl(px(4.))
-                    .child(self.render_checkbox(
-                        task,
-                        skin,
-                        phase,
-                        cx.listener(move |this, _, _, cx| {
-                            this.complete_task(&id_complete, cx);
-                        }),
-                    ))
-                    .when(task.is_priority && !is_editing, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .child(icon_flame(hsl(PRIORITY)).size(px(13.))),
-                        )
-                    })
                     .when(is_editing, |this| {
                         this.child(
                             div().flex_1().min_w(px(0.)).child(
@@ -776,9 +747,10 @@ impl VibeTodoApp {
                                 .whitespace_nowrap()
                                 .overflow_hidden()
                                 .text_ellipsis()
-                                // The only hint that a title can be opened. An
-                                // icon or a rule here would show up on every row
-                                // at rest, which the list cannot afford.
+                                // The only hint that a title can be opened.
+                                // Dragging works from here too, but the grip is
+                                // what says so: a grab cursor over editable text
+                                // advertises the rarer of the two actions.
                                 .cursor_text()
                                 .when(is_done, |s| s.line_through().text_color(rgb(INK_FAINT)))
                                 .when(!is_done, |s| {
@@ -795,11 +767,40 @@ impl VibeTodoApp {
                                         }
                                     },
                                 ))
+                                // Picking a row up anywhere along its title
+                                // beats aiming at the grip. It stays off the
+                                // checkbox and the hover buttons: 2px of travel
+                                // is enough to start a drag, and swallowing a
+                                // tick or a delete that way would be worse than
+                                // the reach it saves.
+                                .on_drag(title_drag_payload, |dragged, _offset, _window, cx| {
+                                    let title = dragged.title.clone();
+                                    cx.new(|_| DragGhost { title })
+                                })
                                 .child(task.title.clone()),
+                        )
+                    })
+                    // After the title, not before it: every row now starts at
+                    // the same x, and the mark reads as a flag on the end
+                    // rather than an indent only some rows get.
+                    //
+                    // Same box and same icon size as the tray button that will
+                    // cover it, so the flame does not shift when the tray slides
+                    // out — it just becomes the switch for what it was showing.
+                    .when(task.is_priority && !is_editing, |this| {
+                        this.child(
+                            div()
+                                .w(px(21.))
+                                .h(px(21.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon_flame_filled(hsl(PRIORITY)).size(px(11.))),
                         )
                     }),
             )
-            .when(!is_done && !is_editing, |this| {
+            .when(phase != Some(Completing::Leaving) && !is_editing, |this| {
                 this.child(
                     // The tray still sits over the title — it fades in from
                     // transparent at its left edge so a long title dissolves
@@ -817,46 +818,6 @@ impl VibeTodoApp {
                         .bg(tray_fade(skin))
                         .invisible()
                         .group_hover("task-row", |s| s.visible())
-                        .child(
-                            action_button(
-                                format!("prio-{}", task.id),
-                                21.,
-                                skin,
-                                false,
-                                icon_flame(if task.is_priority {
-                                    hsl(PRIORITY)
-                                } else {
-                                    hsl(INK_SOFT)
-                                })
-                                .size(px(11.)),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.toggle_priority(&id_priority, cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            // Drag is the pleasant way across; this is the
-                            // reliable one when the list is scrolled away from
-                            // the other section.
-                            action_button(
-                                format!("mv-{}", task.id),
-                                21.,
-                                skin,
-                                false,
-                                match column {
-                                    ColumnType::Ongoing => icon_arrow_down(hsl(INK_SOFT)),
-                                    ColumnType::Inbox => icon_arrow_up(hsl(INK_SOFT)),
-                                }
-                                .size(px(11.)),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.move_task(&id_move, other_column, cx);
-                                },
-                            )),
-                        )
                         .child(
                             action_button(
                                 format!("del-{}", task.id),
@@ -882,6 +843,41 @@ impl VibeTodoApp {
                                     this.request_delete(&id_delete, cx);
                                 },
                             )),
+                        )
+                        .child(
+                            // Lit while the row is held struck-through:
+                            // clicking it again is how the hold is taken back.
+                            action_button(
+                                format!("done-{}", task.id),
+                                21.,
+                                skin,
+                                is_done,
+                                icon_check(hsl(INK_SOFT)).size(px(12.)),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.complete_task(&id_complete, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            action_button(
+                                format!("prio-{}", task.id),
+                                21.,
+                                skin,
+                                false,
+                                if task.is_priority {
+                                    icon_flame_filled(hsl(PRIORITY))
+                                } else {
+                                    icon_flame(hsl(INK_SOFT))
+                                }
+                                .size(px(11.)),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.toggle_priority(&id_priority, cx);
+                                },
+                            )),
                         ),
                 )
             });
@@ -897,102 +893,6 @@ impl VibeTodoApp {
                 .into_any_element(),
             _ => row.into_any_element(),
         }
-    }
-
-    /// The most-clicked control in the window, so its target is the largest
-    /// thing here that does not show. Pressing previews the result rather than
-    /// just darkening: you see what the click is about to do before you let go.
-    fn render_checkbox(
-        &self,
-        task: &Task,
-        skin: Surface,
-        phase: Option<Completing>,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
-    ) -> impl IntoElement {
-        let is_done = phase.is_some();
-        let tick_id = SharedString::from(format!("tick-{}", task.id));
-        // The circle reacts to the whole target around it, so hover and press
-        // are read off the group rather than off the circle's own 16px hitbox.
-        let group = SharedString::from(format!("cb-group-{}", task.id));
-
-        div()
-            .id(SharedString::from(format!("cb-{}", task.id)))
-            .group(group.clone())
-            // 26 x 28 of target inside 16px of layout: the margins give the
-            // extra back so nothing around it moves.
-            .w(px(26.))
-            .h(px(28.))
-            .mx(px(-5.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .on_click(on_click)
-            .child(
-                div()
-                    .id(SharedString::from(format!("cb-mark-{}", task.id)))
-                    .relative()
-                    .w(px(16.))
-                    .h(px(16.))
-                    .rounded_full()
-                    .border_1()
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(is_done, |s| s.border_color(rgb(DONE)).bg(rgb(skin.field)))
-                    .when(!is_done, |s| {
-                        s.bg(rgb(skin.field))
-                            .border_color(rgb(INK_FAINT))
-                            .group_hover(group.clone(), |s| s.border_color(rgb(INK)))
-                            // Pressing previews the outcome instead of merely
-                            // darkening: the colour under the cursor is the one
-                            // the click is about to commit to.
-                            .group_active(group.clone(), |s| {
-                                s.border_color(rgb(DONE)).bg(hsl(DONE).opacity(0.12))
-                            })
-                    })
-                    .when(is_done, |s| {
-                        s.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .bottom_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .with_animation(
-                                    tick_id,
-                                    Animation::new(TICK).with_easing(ease_out_quint()),
-                                    |el, delta| {
-                                        // The fill grows from the middle. With
-                                        // no transforms available, an absolutely
-                                        // positioned disc is the only way to do
-                                        // it without reflowing the row.
-                                        let d = 14. * delta;
-                                        el.child(
-                                            div()
-                                                .absolute()
-                                                .w(px(d))
-                                                .h(px(d))
-                                                .left(px((14. - d) / 2.))
-                                                .top(px((14. - d) / 2.))
-                                                .rounded_full()
-                                                .bg(rgb(DONE)),
-                                        )
-                                        .child(
-                                            div()
-                                                .opacity(((delta - 0.45) / 0.55).clamp(0., 1.))
-                                                .child(icon_check(hsl(0xFFFFFF)).size(px(9.))),
-                                        )
-                                    },
-                                ),
-                        )
-                    }),
-            )
     }
 
     fn render_history_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1150,14 +1050,13 @@ impl VibeTodoApp {
                                                         .h(px(16.))
                                                         .flex_none()
                                                         .rounded_full()
-                                                        .bg(rgb(DONE))
                                                         .border_1()
-                                                        .border_color(rgb(DONE))
+                                                        .border_color(rgb(INK_FAINT))
                                                         .flex()
                                                         .items_center()
                                                         .justify_center()
                                                         .child(
-                                                            icon_check(hsl(0xFFFFFF)).size(px(9.)),
+                                                            icon_check(hsl(INK_SOFT)).size(px(11.)),
                                                         ),
                                                 )
                                                 .child(
@@ -1414,16 +1313,6 @@ impl VibeTodoApp {
                     .flex_1()
                     .min_w(px(0.))
                     .pl(px(4.))
-                    .child(
-                        div()
-                            .w(px(16.))
-                            .h(px(16.))
-                            .flex_none()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(rgb(INK_FAINT))
-                            .bg(rgb(PAPER.field)),
-                    )
                     .child(
                         div().flex_1().min_w(px(0.)).child(
                             // Input carries its own horizontal padding
