@@ -68,6 +68,18 @@ Requires macOS and a stable Rust toolchain (developed on 1.97, edition 2021).
 cargo run --release
 ```
 
+To get the app itself rather than a bare binary — a Dock icon, a name in the
+menu bar, and the window privileges macOS only grants a bundle:
+
+```bash
+./packaging/bundle.sh
+```
+
+It writes `target/release/bundle/Vibe Todo.app`, ad-hoc signed so it launches
+on Apple silicon. Drag it to `/Applications`. The icon is drawn by
+`packaging/make-icon.py` and packed by `packaging/make-icon.sh`; the bundle
+script re-runs them only when the drawing is newer than `AppIcon.icns`.
+
 Pinning uses `NSFloatingWindowLevel` through cocoa/objc directly. That part is
 compiled per target — it is a no-op off macOS — but the app as a whole has only
 been exercised on macOS.
