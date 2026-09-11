@@ -3,20 +3,21 @@
 A todo window that lives on your macOS desk. Native, written in Rust on
 [gpui](https://www.gpui.rs/) — not a web page in a wrapper.
 
-There is one column. The card at the top holds what you are actually working on
-right now; the list underneath is where everything else lands as you think of
-it. To start something, drag it up.
+There is one column, split into two. "进行中" at the top holds what you are
+actually working on right now; "收件箱" underneath is where everything else
+lands as you think of it. To start something, drag it up.
 
 > The interface is in Simplified Chinese, as you can see in the screenshots
 > above. Everything else here — code, comments, this file — is in English.
 
 ## The idea
 
-- **One sheet of paper, with one thing lifted off it.** The whole window is a
-  single warm off-white, running from the title bar to the bottom edge with no
-  divider and no second surface, so empty space reads as room rather than as
-  something unfinished. Only the ongoing card leaves that plane, and it does it
-  by casting a shadow, not by being a different colour.
+- **One sheet of paper.** The whole window is a single warm off-white, running
+  from the title bar to the bottom edge with no second surface, so empty space
+  reads as room rather than as something unfinished. The two sections are told
+  apart by a heading and a hairline; both scroll together, as one sheet. Only
+  the completed-tasks popover and the card under the cursor during a drag leave
+  that plane, and they do it by casting a shadow.
 - **Two colours, one job each.** Blue means done, red means priority. Nothing
   else gets a hue.
 - **Checking something off takes two steps.** The row is struck through and
