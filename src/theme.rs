@@ -1,9 +1,11 @@
-//! Warm paper, and one thing lifted off it.
+//! Warm paper, and the two things allowed to leave it.
 //!
 //! The window is a single warm off-white from the chrome to the bottom edge —
 //! no seams, no second surface — so an empty stretch reads as room rather than
-//! as something unfilled. The ongoing card is the only thing that leaves that
-//! plane, and it does it by casting a shadow, not by being a different colour.
+//! as something unfilled. Both task sections live on that plane and are told
+//! apart by a heading and a hairline, nothing else. Only the history popover
+//! and the card under the cursor during a drag lift off it, and they do it by
+//! casting a shadow.
 //!
 //! Colour is rationed to two, one job each: blue means done, red means
 //! priority. Nothing else is allowed a hue.
@@ -13,7 +15,8 @@ use gpui::{linear_color_stop, linear_gradient, px, rgb, rgba, Background, BoxSha
 /// The whole window. Warm — R and G above B — because the cool grey it
 /// replaced read as clinical at this size.
 pub const GROUND: u32 = 0xFBFAF7;
-pub const CARD_SURFACE: u32 = 0xFFFFFF;
+/// The only white in the window: whatever is floating above the paper.
+pub const RAISED: u32 = 0xFFFFFF;
 pub const HAIRLINE: u32 = 0xEBE7E0;
 
 pub const INK: u32 = 0x1F1D1A;
@@ -26,8 +29,8 @@ pub const DONE: u32 = 0x3D7DE8;
 /// Priority, and the confirm step on destructive actions.
 pub const PRIORITY: u32 = 0xD92D20;
 
-/// Row tints cannot be shared: the card is pure white and the list sits on the
-/// warm ground, so a hover that reads on one is invisible on the other.
+/// A hover tint that reads on the warm ground disappears on white, so the
+/// paper and the popover cannot share one.
 ///
 /// `row_hover` is also what the hover actions are painted with — they slide in
 /// over the title and have to hide it, so tray and row must be the same colour.
@@ -43,7 +46,7 @@ pub struct Surface {
     pub field: u32,
 }
 
-pub const CARD: Surface = Surface {
+pub const POPOVER: Surface = Surface {
     row_hover: 0xF6F4F0,
     action_bg: 0xEDEAE4,
     action_bg_hover: 0xE2DED6,
@@ -51,7 +54,7 @@ pub const CARD: Surface = Surface {
     field: 0xFFFFFF,
 };
 
-pub const LIST: Surface = Surface {
+pub const PAPER: Surface = Surface {
     row_hover: 0xF3F0EA,
     action_bg: 0xE9E5DD,
     action_bg_hover: 0xDED9CF,
@@ -80,9 +83,9 @@ pub fn tray_fade(skin: Surface) -> Background {
 /// shows the title faintly through itself.
 const TRAY_FADE_END: f32 = 0.25;
 
-/// The card is barely a different colour from the ground now, so this is what
-/// separates it: a contact shadow to sit it down, and a wider one to lift it.
-pub fn card_shadow() -> Vec<BoxShadow> {
+/// The card under the cursor during a drag: a contact shadow to sit it down,
+/// and a wider one to lift it off whatever it is passing over.
+pub fn ghost_shadow() -> Vec<BoxShadow> {
     vec![
         BoxShadow::new(px(0.), px(1.), hsl_a(0x0000001A)).blur_radius(px(2.)),
         BoxShadow::new(px(0.), px(4.), hsl_a(0x00000017))

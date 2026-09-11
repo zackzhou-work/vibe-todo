@@ -5,10 +5,11 @@ use crate::theme::*;
 use crate::window_level::set_window_always_on_top;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    actions, div, ease_out_quint, px, rgb, Animation, AnimationExt as _, AnyElement,
+    actions, div, ease_out_quint, px, relative, rgb, Animation, AnimationExt as _, AnyElement,
     AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable as _, FontWeight,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    WindowBounds,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tooltip::Tooltip;
@@ -40,8 +41,8 @@ impl Render for DragGhost {
             .px(px(10.))
             .py(px(7.))
             .rounded(px(8.))
-            .bg(rgb(CARD_SURFACE))
-            .shadow(card_shadow())
+            .bg(rgb(RAISED))
+            .shadow(ghost_shadow())
             .font_family(".SystemUIFont")
             .text_size(px(13.))
             .text_color(rgb(INK))
@@ -80,12 +81,7 @@ const BOUNDS_SETTLE: Duration = Duration::from_millis(500);
 /// runs straight through it into the window.
 const CHROME_HEIGHT: f32 = 34.;
 const GUTTER: f32 = 12.;
-const CARD_PADDING: f32 = 8.;
 const ROW_RADIUS: f32 = 6.;
-/// Apple's concentric rule: an outer radius equals the inner one plus the
-/// padding between them, so the two curves stay parallel. (gpui draws plain
-/// circular arcs — the continuous curvature half of the spec is not available.)
-const CARD_RADIUS: f32 = ROW_RADIUS + CARD_PADDING;
 const ROW_HEIGHT: f32 = 36.;
 
 /// The tray's left inset doubles as the length of its fade: wide enough that a
@@ -93,11 +89,10 @@ const ROW_HEIGHT: f32 = 36.;
 /// so the first button still lands on solid colour.
 const TRAY_FADE: f32 = 24.;
 
-/// The card grows with what is in it, then scrolls. Both ends are pinned so the
-/// inbox underneath can never be squeezed out of the window.
-const CARD_HEADER_HEIGHT: f32 = 28.;
-const CARD_MIN_HEIGHT: f32 = 92.;
-const CARD_MAX_HEIGHT: f32 = 192.;
+const SECTION_HEADER_HEIGHT: f32 = 28.;
+/// How far the label is indented, which is also where the checkbox column
+/// starts: heading and rows are read as one left edge or the eye catches it.
+const LABEL_INDENT: f32 = 16.;
 
 pub struct VibeTodoApp {
     db: Database,
@@ -125,6 +120,9 @@ pub struct VibeTodoApp {
     confirm_clear: bool,
     last_bounds: Option<Bounds<Pixels>>,
     bounds_write_queued: bool,
+    /// The window scrolls as one, so a long ongoing list can push the inbox off
+    /// the bottom. This is how ⌘N gets the field back on screen.
+    body_scroll: ScrollHandle,
     pub focus_handle: FocusHandle,
     _input_sub: Subscription,
     _edit_sub: Subscription,
@@ -181,6 +179,7 @@ impl VibeTodoApp {
             confirm_clear: false,
             last_bounds: None,
             bounds_write_queued: false,
+            body_scroll: ScrollHandle::new(),
             focus_handle,
             _input_sub: input_sub,
             _edit_sub: edit_sub,
@@ -235,6 +234,10 @@ impl VibeTodoApp {
         self.is_history_open = false;
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
+        // The field opens at the top of the inbox, which may be scrolled well
+        // past the bottom edge. Asking for the inbox is enough to reveal it,
+        // and gpui holds the request until the row it needs has been laid out.
+        self.body_scroll.scroll_to_item(BODY_INBOX_INDEX);
         let handle = self.input.focus_handle(cx);
         handle.focus(window, cx);
         cx.notify();
@@ -246,10 +249,12 @@ impl VibeTodoApp {
             let _ = self.db.insert_task(&title, false, ColumnType::Inbox);
             self.refresh_tasks();
         }
-        // Stay open so several thoughts can be parked in a row.
+        // One task per ⌘N. The field used to stay open for a second thought,
+        // but it is rare to have one, and an open field left behind is the
+        // more common cost.
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
-        cx.notify();
+        self.cancel_new_task(window, cx);
     }
 
     pub fn cancel_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -258,8 +263,8 @@ impl VibeTodoApp {
         cx.notify();
     }
 
-    /// Opens a title for editing. Unlike the new-task field, this one starts
-    /// from something that already exists, so clicking away keeps the edit.
+    /// Opens a title for editing. Clicking away keeps what was typed, the same
+    /// as the new-task field.
     pub fn start_editing(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_id.as_deref() == Some(id) {
             return;
@@ -543,13 +548,15 @@ fn drop_indicator(group: &'static str) -> impl IntoElement {
         .child(div().flex_1().h(px(1.5)).bg(rgb(INK)))
 }
 
-/// The card names itself; the count sits opposite. The inbox below stays
-/// unlabelled — it is everything else, which needs no introduction.
-fn card_heading(count: usize) -> impl IntoElement {
+/// Names the section and says how much is in it. The two headings are the
+/// only thing separating the sections apart from the hairline, so neither can
+/// afford to sit off the column the rows below it start on.
+fn section_heading(label: &'static str, count: usize, skin: Surface) -> impl IntoElement {
     div()
-        .h(px(CARD_HEADER_HEIGHT))
+        .h(px(SECTION_HEADER_HEIGHT))
         .flex_none()
-        .px(px(CARD_PADDING + 4.))
+        .pl(px(4.))
+        .pr(px(6.))
         .pt(px(8.))
         .flex()
         .flex_row()
@@ -557,27 +564,43 @@ fn card_heading(count: usize) -> impl IntoElement {
         .justify_between()
         .child(
             div()
+                // Clears the grip column, landing the label on the checkboxes.
+                .pl(px(LABEL_INDENT))
                 .text_size(px(11.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(INK_SOFT))
-                .child("进行中"),
+                .child(label),
         )
         .child(
             div()
                 .text_size(px(10.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(INK_SOFT))
-                .bg(rgb(CARD.action_bg))
+                .bg(rgb(skin.action_bg))
                 .px(px(5.))
                 .py(px(1.))
                 .rounded(px(8.))
-                .child(format!("{}", count)),
+                .child(count.to_string()),
         )
 }
 
-/// An empty region says what to do next rather than sitting blank. There is no
-/// heading anywhere in the window, so for the card this copy is also the only
-/// thing that says what the card is for.
+/// All that divides the two sections, now that neither has a surface of its
+/// own. Inset to the gutter so it reads as a fold in the paper rather than as
+/// an edge of the window.
+///
+/// Only a bottom margin: the space above is the ongoing section's tail, which
+/// has to be there anyway to catch a drop past the last row. Adding a top
+/// margin as well pushed the line down against the heading below it.
+fn section_hairline() -> impl IntoElement {
+    div()
+        .flex_none()
+        .mx(px(GUTTER))
+        .mb(px(6.))
+        .h(px(1.))
+        .bg(rgb(HAIRLINE))
+}
+
+/// An empty region says what to do next rather than sitting blank.
 fn empty_lines(line: &'static str, hint: &'static str) -> impl IntoElement {
     div()
         .flex()
@@ -600,8 +623,15 @@ fn empty_lines(line: &'static str, hint: &'static str) -> impl IntoElement {
 }
 
 impl VibeTodoApp {
-    fn render_task_row(&self, task: &Task, on_card: bool, cx: &mut Context<Self>) -> AnyElement {
-        let skin = if on_card { CARD } else { LIST };
+    fn render_task_row(
+        &self,
+        task: &Task,
+        column: ColumnType,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Both sections stand on the same paper, so they are painted with the
+        // same surface; POPOVER is left to the one plane that is still white.
+        let skin = PAPER;
         let phase = self.completing.get(&task.id).copied();
         let is_done = phase.is_some();
         let is_editing = self.editing_id.as_deref() == Some(task.id.as_str());
@@ -620,10 +650,9 @@ impl VibeTodoApp {
             title: ghost_title.clone(),
         };
         let anchor_id = task.id.clone();
-        let drop_column = if on_card {
-            ColumnType::Ongoing
-        } else {
-            ColumnType::Inbox
+        let other_column = match column {
+            ColumnType::Ongoing => ColumnType::Inbox,
+            ColumnType::Inbox => ColumnType::Ongoing,
         };
 
         let row = div()
@@ -642,9 +671,8 @@ impl VibeTodoApp {
             .rounded(px(ROW_RADIUS))
             .hover(|s| s.bg(rgb(skin.row_hover)))
             .when(is_editing, |s| {
-                // Clicking away keeps the edit. The new-task field does the
-                // opposite: one is a change to something that exists, the other
-                // was never saved in the first place.
+                // Clicking away keeps the edit — same idea as the new-task
+                // field, which commits when there is text to save.
                 s.bg(rgb(skin.row_hover))
                     .on_mouse_down_out(cx.listener(|this, _, window, cx| {
                         this.commit_edit(window, cx);
@@ -669,7 +697,7 @@ impl VibeTodoApp {
             // Dropping onto a row inserts above it, which is what the insertion
             // line drawn on drag_over promises.
             .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                this.reposition_task(&dragged.id, drop_column, Some(&anchor_id), cx);
+                this.reposition_task(&dragged.id, column, Some(&anchor_id), cx);
                 cx.stop_propagation();
             }))
             .child(drop_indicator("task-row"))
@@ -687,6 +715,12 @@ impl VibeTodoApp {
                     .justify_center()
                     .cursor_grab()
                     .active(|s| s.cursor_grabbing())
+                    // Hidden at rest, by opacity rather than by visibility:
+                    // gpui skips painting a hidden element and with it the drag
+                    // listener. The hover tray wants that — it covers the title
+                    // and must not be grabbable through it — the grip does not.
+                    .opacity(0.)
+                    .group_hover("task-row", |s| s.opacity(1.))
                     .child(icon_grip(hsl(INK_FAINT)).size(px(12.)))
                     .when(!is_editing, |s| {
                         s.on_drag(drag_payload, move |dragged, _offset, _window, cx| {
@@ -805,26 +839,21 @@ impl VibeTodoApp {
                         .child(
                             // Drag is the pleasant way across; this is the
                             // reliable one when the list is scrolled away from
-                            // the card.
+                            // the other section.
                             action_button(
                                 format!("mv-{}", task.id),
                                 21.,
                                 skin,
                                 false,
-                                if on_card {
-                                    icon_arrow_down(hsl(INK_SOFT)).size(px(11.))
-                                } else {
-                                    icon_arrow_up(hsl(INK_SOFT)).size(px(11.))
-                                },
+                                match column {
+                                    ColumnType::Ongoing => icon_arrow_down(hsl(INK_SOFT)),
+                                    ColumnType::Inbox => icon_arrow_up(hsl(INK_SOFT)),
+                                }
+                                .size(px(11.)),
                             )
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    let target = if on_card {
-                                        ColumnType::Inbox
-                                    } else {
-                                        ColumnType::Ongoing
-                                    };
-                                    this.move_task(&id_move, target, cx);
+                                    this.move_task(&id_move, other_column, cx);
                                 },
                             )),
                         )
@@ -967,215 +996,232 @@ impl VibeTodoApp {
     }
 
     fn render_history_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let skin = CARD;
+        let skin = POPOVER;
         let confirm_clear = self.confirm_clear;
         let is_empty = self.completed_tasks.is_empty();
 
+        // The popover hangs under the button that opens it, but 272 x 300 is a
+        // wish, not a size: at the smallest window it allows it would run off
+        // the left edge and the bottom. So it stretches inside a frame cut to
+        // the window instead, and takes whichever is smaller.
         div()
-            .id("history-popover")
             .absolute()
             .top(px(CHROME_HEIGHT + 2.))
+            .left(px(GUTTER))
             .right(px(GUTTER))
-            .w(px(272.))
+            .bottom(px(GUTTER))
             .max_h(px(300.))
-            .bg(rgb(CARD_SURFACE))
-            .border_1()
-            .border_color(rgb(HAIRLINE))
-            .rounded(px(10.))
-            .shadow(popover_shadow())
             .flex()
-            .flex_col()
-            .overflow_hidden()
+            .justify_end()
+            .items_start()
             .child(
                 div()
-                    .px(px(10.))
-                    .pt(px(9.))
-                    .pb(px(4.))
+                    .id("history-popover")
+                    .w_full()
+                    .max_w(px(272.))
+                    .max_h(relative(1.))
+                    .bg(rgb(RAISED))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded(px(10.))
+                    .shadow(popover_shadow())
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .overflow_hidden()
                     .child(
                         div()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(INK_SOFT))
-                            .child("已完成"),
+                            .px(px(10.))
+                            .pt(px(9.))
+                            .pb(px(4.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(INK_SOFT))
+                                    .child("已完成"),
+                            )
+                            // Clearing history cannot be undone, so the first click only
+                            // arms the button and says what the second one will do. It
+                            // disarms itself on a timer and when the pointer leaves, so
+                            // a click landing later cannot finish it.
+                            .when(!is_empty, |this| {
+                                this.child(
+                                    div()
+                                        .id("clear-completed")
+                                        .h(px(19.))
+                                        .px(px(5.))
+                                        .rounded(px(4.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(skin.action_bg)))
+                                        .active(|s| s.bg(rgb(skin.action_bg_active)))
+                                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                            if !*hovered && this.confirm_clear {
+                                                this.confirm_clear = false;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.clear_completed(cx);
+                                        }))
+                                        .when(confirm_clear, |s| {
+                                            s.child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(PRIORITY))
+                                                    .child("再点一次清空"),
+                                            )
+                                        })
+                                        .when(!confirm_clear, |s| {
+                                            s.child(icon_trash(hsl(INK_SOFT)).size(px(11.)))
+                                        }),
+                                )
+                            }),
                     )
-                    // Clearing history cannot be undone, so the first click only
-                    // arms the button and says what the second one will do. It
-                    // disarms itself on a timer and when the pointer leaves, so
-                    // a click landing later cannot finish it.
+                    .when(is_empty, |this| {
+                        this.child(
+                            div()
+                                .px(px(12.))
+                                .pt(px(2.))
+                                .pb(px(14.))
+                                .text_size(px(11.5))
+                                .text_color(rgb(INK_FAINT))
+                                .child("勾掉的任务会留在这里"),
+                        )
+                    })
                     .when(!is_empty, |this| {
                         this.child(
                             div()
-                                .id("clear-completed")
-                                .h(px(19.))
-                                .px(px(5.))
-                                .rounded(px(4.))
+                                .id("completed-list")
+                                .px(px(6.))
+                                .pb(px(6.))
+                                .pt(px(2.))
                                 .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(skin.action_bg)))
-                                .active(|s| s.bg(rgb(skin.action_bg_active)))
-                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                    if !*hovered && this.confirm_clear {
-                                        this.confirm_clear = false;
-                                        cx.notify();
-                                    }
-                                }))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.clear_completed(cx);
-                                }))
-                                .when(confirm_clear, |s| {
-                                    s.child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(PRIORITY))
-                                            .child("再点一次清空"),
-                                    )
-                                })
-                                .when(!confirm_clear, |s| {
-                                    s.child(icon_trash(hsl(INK_SOFT)).size(px(11.)))
-                                }),
+                                .flex_col()
+                                .gap(px(2.))
+                                .overflow_y_scroll()
+                                .children(self.completed_tasks.iter().map(|task| {
+                                    let id_restore = task.id.clone();
+                                    let id_delete = task.id.clone();
+                                    let id_hover = task.id.clone();
+                                    let is_armed =
+                                        self.confirm_delete.as_deref() == Some(task.id.as_str());
+
+                                    div()
+                                        .id(SharedString::from(format!("completed-{}", task.id)))
+                                        .group("completed-row")
+                                        .h(px(30.))
+                                        .px(px(6.))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(px(5.))
+                                        .hover(|s| s.bg(rgb(POPOVER.row_hover)))
+                                        .on_hover(cx.listener(
+                                            move |this, hovered: &bool, _, cx| {
+                                                if !*hovered
+                                                    && this.confirm_delete.as_deref()
+                                                        == Some(id_hover.as_str())
+                                                {
+                                                    this.confirm_delete = None;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(8.))
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .child(
+                                                    div()
+                                                        .w(px(16.))
+                                                        .h(px(16.))
+                                                        .flex_none()
+                                                        .rounded_full()
+                                                        .bg(rgb(DONE))
+                                                        .border_1()
+                                                        .border_color(rgb(DONE))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .child(
+                                                            icon_check(hsl(0xFFFFFF)).size(px(9.)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.))
+                                                        .text_size(px(12.5))
+                                                        .text_color(rgb(INK_SOFT))
+                                                        .line_through()
+                                                        .whitespace_nowrap()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .child(task.title.clone()),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(4.))
+                                                .flex_none()
+                                                .invisible()
+                                                .group_hover("completed-row", |s| s.visible())
+                                                .child(
+                                                    action_button(
+                                                        format!("restore-{}", task.id),
+                                                        19.,
+                                                        skin,
+                                                        false,
+                                                        icon_rotate_ccw(hsl(INK_SOFT))
+                                                            .size(px(10.)),
+                                                    )
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.restore_task(&id_restore, cx);
+                                                    })),
+                                                )
+                                                .child(
+                                                    action_button(
+                                                        format!("cdel-{}", task.id),
+                                                        19.,
+                                                        skin,
+                                                        false,
+                                                        icon_trash(if is_armed {
+                                                            hsl(0xFFFFFF)
+                                                        } else {
+                                                            hsl(INK_SOFT)
+                                                        })
+                                                        .size(px(10.)),
+                                                    )
+                                                    .when(is_armed, |s| {
+                                                        s.bg(rgb(PRIORITY))
+                                                            .hover(|s| s.bg(rgb(PRIORITY)))
+                                                            .active(|s| s.bg(rgb(PRIORITY)))
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.request_delete(&id_delete, cx);
+                                                    })),
+                                                ),
+                                        )
+                                })),
                         )
                     }),
             )
-            .when(is_empty, |this| {
-                this.child(
-                    div()
-                        .px(px(12.))
-                        .pt(px(2.))
-                        .pb(px(14.))
-                        .text_size(px(11.5))
-                        .text_color(rgb(INK_FAINT))
-                        .child("勾掉的任务会留在这里"),
-                )
-            })
-            .when(!is_empty, |this| {
-                this.child(
-                    div()
-                        .id("completed-list")
-                        .px(px(6.))
-                        .pb(px(6.))
-                        .pt(px(2.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .overflow_y_scroll()
-                        .children(self.completed_tasks.iter().map(|task| {
-                            let id_restore = task.id.clone();
-                            let id_delete = task.id.clone();
-                            let id_hover = task.id.clone();
-                            let is_armed = self.confirm_delete.as_deref() == Some(task.id.as_str());
-
-                            div()
-                                .id(SharedString::from(format!("completed-{}", task.id)))
-                                .group("completed-row")
-                                .h(px(30.))
-                                .px(px(6.))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .rounded(px(5.))
-                                .hover(|s| s.bg(rgb(CARD.row_hover)))
-                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                    if !*hovered
-                                        && this.confirm_delete.as_deref() == Some(id_hover.as_str())
-                                    {
-                                        this.confirm_delete = None;
-                                        cx.notify();
-                                    }
-                                }))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .child(
-                                            div()
-                                                .w(px(16.))
-                                                .h(px(16.))
-                                                .flex_none()
-                                                .rounded_full()
-                                                .bg(rgb(DONE))
-                                                .border_1()
-                                                .border_color(rgb(DONE))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(icon_check(hsl(0xFFFFFF)).size(px(9.))),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .text_size(px(12.5))
-                                                .text_color(rgb(INK_SOFT))
-                                                .line_through()
-                                                .whitespace_nowrap()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .child(task.title.clone()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.))
-                                        .flex_none()
-                                        .invisible()
-                                        .group_hover("completed-row", |s| s.visible())
-                                        .child(
-                                            action_button(
-                                                format!("restore-{}", task.id),
-                                                19.,
-                                                skin,
-                                                false,
-                                                icon_rotate_ccw(hsl(INK_SOFT)).size(px(10.)),
-                                            )
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.restore_task(&id_restore, cx);
-                                                }),
-                                            ),
-                                        )
-                                        .child(
-                                            action_button(
-                                                format!("cdel-{}", task.id),
-                                                19.,
-                                                skin,
-                                                false,
-                                                icon_trash(if is_armed {
-                                                    hsl(0xFFFFFF)
-                                                } else {
-                                                    hsl(INK_SOFT)
-                                                })
-                                                .size(px(10.)),
-                                            )
-                                            .when(is_armed, |s| {
-                                                s.bg(rgb(PRIORITY))
-                                                    .hover(|s| s.bg(rgb(PRIORITY)))
-                                                    .active(|s| s.bg(rgb(PRIORITY)))
-                                            })
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.request_delete(&id_delete, cx);
-                                                }),
-                                            ),
-                                        ),
-                                )
-                        })),
-                )
-            })
     }
 }
 
@@ -1211,7 +1257,7 @@ impl VibeTodoApp {
                         action_button(
                             "btn-add",
                             22.,
-                            LIST,
+                            PAPER,
                             false,
                             icon_plus(hsl(INK_SOFT)).size(px(13.)),
                         )
@@ -1229,7 +1275,7 @@ impl VibeTodoApp {
                         action_button(
                             "btn-history",
                             22.,
-                            LIST,
+                            PAPER,
                             is_history_open,
                             icon_history(hsl(INK_SOFT)).size(px(12.)),
                         )
@@ -1247,11 +1293,11 @@ impl VibeTodoApp {
                         // Pinning is the one mode that stays on, so it is said
                         // in the ink the rest of the window already speaks:
                         // a solid glyph at full strength. A filled swatch behind
-                        // it out-shouted the card it sits above.
+                        // it out-shouted the paper it sits above.
                         action_button(
                             "btn-pin",
                             22.,
-                            LIST,
+                            PAPER,
                             false,
                             if is_pinned {
                                 icon_pin_filled(hsl(INK)).size(px(12.))
@@ -1270,109 +1316,69 @@ impl VibeTodoApp {
             )
     }
 
-    /// What is actually being worked on. The only opaque surface in the window,
-    /// which is the whole of how it says "this is the live one" — the rows
-    /// inside are the same rows as the inbox below.
-    fn render_ongoing_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_empty = self.ongoing_tasks.is_empty();
+    /// One section of tasks, on the shared paper ground. Both are built here so
+    /// the two cannot drift apart: a heading, the rows, then a tail that takes
+    /// drops landing past the last row and carries the empty copy when there is
+    /// no row to drop onto yet.
+    fn render_section(&self, column: ColumnType, cx: &mut Context<Self>) -> impl IntoElement {
+        let (id, tail_id, label, empty_line, empty_hint, tasks) = match column {
+            ColumnType::Ongoing => (
+                "ongoing-section",
+                "ongoing-tail",
+                "进行中",
+                "还没有开始的事",
+                "从下面拖一件上来",
+                &self.ongoing_tasks,
+            ),
+            ColumnType::Inbox => (
+                "inbox-section",
+                "inbox-tail",
+                "收件箱",
+                "收件箱是空的",
+                "⌘N 记一笔",
+                &self.inbox_tasks,
+            ),
+        };
+        let show_add_row = matches!(column, ColumnType::Inbox) && self.is_creating;
+        let is_empty = tasks.is_empty() && !show_add_row;
 
         div()
-            .id("ongoing-card")
+            .id(id)
             .flex_none()
-            .mx(px(GUTTER))
-            .min_h(px(CARD_MIN_HEIGHT))
-            .max_h(px(CARD_MAX_HEIGHT))
-            .flex()
-            .flex_col()
-            .rounded(px(CARD_RADIUS))
-            .bg(rgb(CARD_SURFACE))
-            .shadow(card_shadow())
-            // The border is what makes the white card meet the grey ground
-            // cleanly; on drag it darkens rather than appearing, so arming the
-            // drop target cannot shift the card by a pixel.
-            .border_1()
-            .border_color(rgb(HAIRLINE))
-            .drag_over::<DraggedTask>(|s, _, _, _| s.border_color(rgb(INK_FAINT)))
-            .overflow_hidden()
-            // Dropping anywhere on the card appends; a row under the cursor
-            // takes precedence and inserts above itself instead.
-            .on_drop(cx.listener(|this, dragged: &DraggedTask, _, cx| {
-                this.reposition_task(&dragged.id, ColumnType::Ongoing, None, cx);
-            }))
-            .child(card_heading(self.ongoing_tasks.len()))
-            .when(is_empty, |this| {
-                this.child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(empty_lines("还没有开始的事", "从下面拖一件上来")),
-                )
-            })
-            .when(!is_empty, |this| {
-                this.child(
-                    div()
-                        .id("ongoing-list")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .p(px(CARD_PADDING))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.))
-                        .overflow_y_scroll()
-                        .children(
-                            self.ongoing_tasks
-                                .iter()
-                                .map(|task| self.render_task_row(task, true, cx)),
-                        ),
-                )
-            })
-    }
-
-    /// Everything parked. Sits directly on the glass with no container of its
-    /// own — the card above is the only thing in the window that gets one.
-    fn render_inbox_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_add_row = self.is_creating;
-        let is_empty = self.inbox_tasks.is_empty() && !show_add_row;
-
-        div()
-            .id("inbox-list")
-            .flex_1()
-            .min_h(px(0.))
-            // GUTTER + the card's own inner padding, so a row in the list and a
-            // row in the card start at exactly the same x.
-            .px(px(GUTTER + CARD_PADDING))
-            .pt(px(10.))
-            .pb(px(6.))
+            .px(px(GUTTER))
             .flex()
             .flex_col()
             .gap(px(1.))
-            .overflow_y_scroll()
+            // The fallback for a drop that lands on the heading or in a gap. A
+            // row or the tail under the cursor is more specific and stops the
+            // event before it reaches here.
+            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                this.reposition_task(&dragged.id, column, None, cx);
+            }))
+            .child(section_heading(label, tasks.len(), PAPER))
             .when(show_add_row, |this| this.child(self.render_add_row(cx)))
             .children(
-                self.inbox_tasks
+                tasks
                     .iter()
-                    .map(|task| self.render_task_row(task, false, cx)),
+                    .map(|task| self.render_task_row(task, column, cx)),
             )
-            // The tail takes drops that land past the last row, and is where
-            // the empty copy goes so that an empty inbox is still a target.
             .child(
                 div()
-                    .id("drop-end")
-                    .group("drop-end")
+                    .id(tail_id)
+                    .group(tail_id)
                     .relative()
-                    .flex_1()
+                    .flex_none()
                     .min_h(px(12.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_drop(cx.listener(|this, dragged: &DraggedTask, _, cx| {
-                        this.reposition_task(&dragged.id, ColumnType::Inbox, None, cx);
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        this.reposition_task(&dragged.id, column, None, cx);
+                        cx.stop_propagation();
                     }))
-                    .child(drop_indicator("drop-end"))
+                    .child(drop_indicator(tail_id))
                     .when(is_empty, |this| {
-                        this.child(empty_lines("收件箱是空的", "⌘N 记一笔"))
+                        this.py(px(18.)).child(empty_lines(empty_line, empty_hint))
                     }),
             )
     }
@@ -1387,13 +1393,14 @@ impl VibeTodoApp {
             .flex()
             .flex_row()
             .items_center()
-            .rounded(px(6.))
-            .bg(rgb(CARD_SURFACE))
-            // Clicking anywhere else drops the half-written task. A rename does
-            // the opposite and keeps it — one is unsaved, the other is an edit
-            // to something that already exists.
+            .rounded(px(ROW_RADIUS))
+            // Typing into the list looks the same whether the row is new or
+            // being renamed, so this is the tint a row wears while editing.
+            .bg(rgb(PAPER.row_hover))
+            // Clicking away is the same as pressing enter: keep whatever was
+            // typed, drop an empty field.
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.cancel_new_task(window, cx);
+                this.commit_new_task(window, cx);
             }))
             // Stands in for the grip column so the field lines up with the rows
             // it is about to join.
@@ -1415,7 +1422,7 @@ impl VibeTodoApp {
                             .rounded_full()
                             .border_1()
                             .border_color(rgb(INK_FAINT))
-                            .bg(rgb(CARD_SURFACE)),
+                            .bg(rgb(PAPER.field)),
                     )
                     .child(
                         div().flex_1().min_w(px(0.)).child(
@@ -1436,6 +1443,11 @@ impl VibeTodoApp {
 /// Long enough that sweeping past a button never summons one. These three are
 /// the only labels in the window, and it is a window people glance at all day.
 const TOOLTIP_DELAY: Duration = Duration::from_millis(600);
+
+/// Where the inbox sits among the body scroller's children. `scroll_to_item`
+/// addresses them by index, so this and the order built in `render` have to
+/// stay in step.
+const BODY_INBOX_INDEX: usize = 2;
 
 impl Render for VibeTodoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1481,8 +1493,21 @@ impl Render for VibeTodoApp {
             .font_family(".SystemUIFont")
             .text_color(rgb(INK))
             .child(self.render_chrome(cx))
-            .child(self.render_ongoing_card(cx))
-            .child(self.render_inbox_list(cx))
+            // Both sections share one scroller, so each keeps the height of
+            // what is in it and the window moves as a single sheet of paper.
+            .child(
+                div()
+                    .id("body-scroll")
+                    .track_scroll(&self.body_scroll)
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_section(ColumnType::Ongoing, cx))
+                    .child(section_hairline())
+                    .child(self.render_section(ColumnType::Inbox, cx)),
+            )
             // The scrim starts below the chrome so a second click on the history
             // button reaches the button instead of being cancelled out by it.
             .when(is_history_open, |this| {

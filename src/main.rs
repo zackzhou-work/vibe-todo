@@ -4,8 +4,8 @@ use vibe_todo::db::Database;
 use vibe_todo::window_level::set_window_always_on_top;
 
 /// Narrower than this and the hover tray covers most of a title; shorter and
-/// the ongoing card has nothing left to show. It is where resizing stops, not a
-/// layout limit.
+/// there is no room for both headings and a row under either. It is where
+/// resizing stops, not a layout limit.
 const MIN_WIDTH: f32 = 260.;
 const MIN_HEIGHT: f32 = 220.;
 
